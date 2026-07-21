@@ -1,0 +1,25 @@
+{
+  "finishedAt": "2026-07-21T10:25:54.727Z",
+  "offscreen": {
+    "context": "offscreen",
+    "error": {
+      "message": "Aborted(CompileError: WebAssembly.instantiate(): Compiling or instantiating WebAssembly module violates the following Content Security policy directive because neither 'wasm-eval' nor 'unsafe-eval' is an allowed source of script in the following Content Security Policy directive: ). Build with -sASSERTIONS for more info.",
+      "name": "RuntimeError",
+      "stack": "RuntimeError: Aborted(CompileError: WebAssembly.instantiate(): Compiling or instantiating WebAssembly module violates the following Content Security policy directive because neither 'wasm-eval' nor 'unsafe-eval' is an allowed source of script in the following Content Security Policy directive: ). Build with -sASSERTIONS for more info.\n    at abort (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:1685:13)\n    at instantiateArrayBuffer (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:1726:7)\n    at async createWasm (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:1784:18)\n    at async Module (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:3105:17)\n    at async initializeBinding (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:3121:22)\n    at async Parser.init (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:3152:15)\n    at async initParser (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:3974:3)\n    at async runSpike (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/offscreen.js:4096:34)"
+    },
+    "hasDocument": true,
+    "hasXHR": true,
+    "ok": false
+  },
+  "sw": {
+    "context": "service_worker",
+    "error": {
+      "message": "Aborted(CompileError: WebAssembly.instantiate(): Compiling or instantiating WebAssembly module violates the following Content Security policy directive because neither 'wasm-eval' nor 'unsafe-eval' is an allowed source of script in the following Content Security Policy directive: ). Build with -sASSERTIONS for more info.",
+      "name": "RuntimeError",
+      "stack": "RuntimeError: Aborted(CompileError: WebAssembly.instantiate(): Compiling or instantiating WebAssembly module violates the following Content Security policy directive because neither 'wasm-eval' nor 'unsafe-eval' is an allowed source of script in the following Content Security Policy directive: ). Build with -sASSERTIONS for more info.\n    at abort (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:1685:13)\n    at instantiateArrayBuffer (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:1726:7)\n    at async createWasm (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:1784:18)\n    at async Module (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:3105:17)\n    at async initializeBinding (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:3121:22)\n    at async Parser.init (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:3152:15)\n    at async initParser (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:3974:3)\n    at async runSpike (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:4096:34)\n    at async main (chrome-extension://gkjlnnomjmaagngiccdfkmadkbjanain/sw.js:4144:14)"
+    },
+    "hasDocument": false,
+    "hasXHR": false,
+    "ok": false
+  }
+}

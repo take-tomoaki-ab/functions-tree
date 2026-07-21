@@ -1,0 +1,19 @@
+{
+  "name": "functions-tree-phase0-spike",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "copy-wasm": "mkdir -p ext/wasm && cp node_modules/web-tree-sitter/web-tree-sitter.wasm ext/wasm/ && cp node_modules/tree-sitter-typescript/tree-sitter-typescript.wasm ext/wasm/",
+    "build": "npm run copy-wasm && esbuild src/sw.js --bundle --format=esm --external:module --external:fs --external:path --outfile=ext/sw.js && esbuild src/offscreen.js --bundle --format=esm --external:module --external:fs --external:path --outfile=ext/offscreen.js",
+    "node-test": "node node-test.mjs"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.1",
+    "tree-sitter-typescript": "^0.23.2",
+    "web-tree-sitter": "^0.26.11"
+  },
+  "devDependencies": {
+    "playwright": "^1.58.2"
+  }
+}

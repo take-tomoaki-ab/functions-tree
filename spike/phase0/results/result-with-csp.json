@@ -1,0 +1,233 @@
+{
+  "finishedAt": "2026-07-21T10:26:12.174Z",
+  "offscreen": {
+    "context": "offscreen",
+    "hasDocument": true,
+    "hasXHR": true,
+    "initMs": 7,
+    "ok": true,
+    "parseMs": 7,
+    "result": {
+      "functions": [
+        {
+          "calls": [
+            {
+              "callee": "utils.toUpper",
+              "line": 6
+            }
+          ],
+          "endLine": 8,
+          "kind": "function_declaration",
+          "name": "greet",
+          "startLine": 5
+        },
+        {
+          "calls": [
+            {
+              "callee": "log",
+              "line": 11
+            }
+          ],
+          "endLine": 13,
+          "kind": "variable_declarator",
+          "name": "add",
+          "startLine": 10
+        },
+        {
+          "calls": [
+            {
+              "callee": "this.cache.has",
+              "line": 19
+            },
+            {
+              "callee": "this.cache.get",
+              "line": 19
+            },
+            {
+              "callee": "fetchUser",
+              "line": 20
+            },
+            {
+              "callee": "this.cache.set",
+              "line": 21
+            }
+          ],
+          "endLine": 23,
+          "kind": "method_definition",
+          "name": "getUser",
+          "startLine": 18
+        },
+        {
+          "calls": [
+            {
+              "callee": "this.cache.clear",
+              "line": 26
+            }
+          ],
+          "endLine": 27,
+          "kind": "method_definition",
+          "name": "clear",
+          "startLine": 25
+        },
+        {
+          "calls": [
+            {
+              "callee": "console.log",
+              "line": 31
+            },
+            {
+              "callee": "Logger.write",
+              "line": 32
+            },
+            {
+              "callee": "String",
+              "line": 32
+            }
+          ],
+          "endLine": 33,
+          "kind": "function_declaration",
+          "name": "log",
+          "startLine": 30
+        }
+      ],
+      "imports": [
+        {
+          "line": 1,
+          "names": [
+            "fetchUser"
+          ],
+          "source": "./api/user"
+        },
+        {
+          "line": 2,
+          "names": [
+            "utils"
+          ],
+          "source": "./utils"
+        },
+        {
+          "line": 3,
+          "names": [
+            "Logger"
+          ],
+          "source": "./logger"
+        }
+      ]
+    }
+  },
+  "sw": {
+    "context": "service_worker",
+    "hasDocument": false,
+    "hasXHR": false,
+    "initMs": 10,
+    "ok": true,
+    "parseMs": 16,
+    "result": {
+      "functions": [
+        {
+          "calls": [
+            {
+              "callee": "utils.toUpper",
+              "line": 6
+            }
+          ],
+          "endLine": 8,
+          "kind": "function_declaration",
+          "name": "greet",
+          "startLine": 5
+        },
+        {
+          "calls": [
+            {
+              "callee": "log",
+              "line": 11
+            }
+          ],
+          "endLine": 13,
+          "kind": "variable_declarator",
+          "name": "add",
+          "startLine": 10
+        },
+        {
+          "calls": [
+            {
+              "callee": "this.cache.has",
+              "line": 19
+            },
+            {
+              "callee": "this.cache.get",
+              "line": 19
+            },
+            {
+              "callee": "fetchUser",
+              "line": 20
+            },
+            {
+              "callee": "this.cache.set",
+              "line": 21
+            }
+          ],
+          "endLine": 23,
+          "kind": "method_definition",
+          "name": "getUser",
+          "startLine": 18
+        },
+        {
+          "calls": [
+            {
+              "callee": "this.cache.clear",
+              "line": 26
+            }
+          ],
+          "endLine": 27,
+          "kind": "method_definition",
+          "name": "clear",
+          "startLine": 25
+        },
+        {
+          "calls": [
+            {
+              "callee": "console.log",
+              "line": 31
+            },
+            {
+              "callee": "Logger.write",
+              "line": 32
+            },
+            {
+              "callee": "String",
+              "line": 32
+            }
+          ],
+          "endLine": 33,
+          "kind": "function_declaration",
+          "name": "log",
+          "startLine": 30
+        }
+      ],
+      "imports": [
+        {
+          "line": 1,
+          "names": [
+            "fetchUser"
+          ],
+          "source": "./api/user"
+        },
+        {
+          "line": 2,
+          "names": [
+            "utils"
+          ],
+          "source": "./utils"
+        },
+        {
+          "line": 3,
+          "names": [
+            "Logger"
+          ],
+          "source": "./logger"
+        }
+      ]
+    }
+  }
+}
