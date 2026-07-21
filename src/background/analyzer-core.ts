@@ -10,6 +10,8 @@ import type {
   GraphNode,
   SkippedFile,
 } from '../shared/graph';
+import type { PatchCommentableLines } from './diff-lines';
+import { commentableLinesForRange, parsePatchCommentableLines } from './diff-lines';
 
 /** 解析対象の拡張子。.tsx / .jsx は tsx 文法、それ以外は typescript 文法でパースする */
 export const ANALYZABLE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
@@ -343,6 +345,13 @@ export type FetchFileResult =
   | { ok: true; content: string }
   | { ok: false; reason: string };
 
+/** PR の変更ファイル 1 つ。patch は行レベルのコメント可否判定に使う（無くてもよい） */
+export interface ChangedFileInput {
+  path: string;
+  /** GET /pulls/{n}/files の unified diff。バイナリ / 巨大ファイルでは undefined */
+  patch?: string;
+}
+
 export interface BuildGraphOptions {
   /** 依存を辿る深さ（既定 1）。0 なら変更ファイルのみ */
   dependencyDepth?: number;
@@ -361,7 +370,7 @@ export interface BuildGraphOptions {
  */
 export async function buildGraph(
   analyzer: Analyzer,
-  changedPaths: string[],
+  changedFiles: ChangedFileInput[],
   fetchFile: (path: string) => Promise<FetchFileResult>,
   options: BuildGraphOptions = {}
 ): Promise<FunctionGraph> {
@@ -372,8 +381,16 @@ export async function buildGraph(
   const maxDependencyFetches =
     options.maxDependencyFetches ?? DEFAULT_MAX_DEPENDENCY_FETCHES;
 
-  const analyzable = changedPaths.filter(isAnalyzablePath);
+  const analyzable = changedFiles
+    .map((f) => f.path)
+    .filter(isAnalyzablePath);
   const changedSet = new Set(analyzable.slice(0, maxChangedFiles));
+  // 変更ファイルごとの「コメント可能な行集合」（patch の RIGHT サイド）
+  const patchLinesByPath = new Map<string, PatchCommentableLines>(
+    changedFiles
+      .filter((f) => changedSet.has(f.path))
+      .map((f) => [f.path, parsePatchCommentableLines(f.patch)])
+  );
   const analyzed = new Map<string, FileAnalysis>();
   const skipped: SkippedFile[] = [];
 
@@ -452,7 +469,7 @@ export async function buildGraph(
     frontier = added;
   }
 
-  return assembleGraph(analyzed, changedSet, skipped);
+  return assembleGraph(analyzed, changedSet, patchLinesByPath, skipped);
 }
 
 function nodeId(path: string, name: string, startLine: number): string {
@@ -462,6 +479,7 @@ function nodeId(path: string, name: string, startLine: number): string {
 function assembleGraph(
   analyzed: Map<string, FileAnalysis>,
   changedSet: Set<string>,
+  patchLinesByPath: Map<string, PatchCommentableLines>,
   skippedFiles: SkippedFile[]
 ): FunctionGraph {
   const nodes: GraphNode[] = [];
@@ -474,7 +492,13 @@ function assembleGraph(
     const topLevel = new Map<string, FunctionInfo>();
     const methods = new Map<string, FunctionInfo>();
     const exports = new Map<string, FunctionInfo>();
+    const patchLines = patchLinesByPath.get(path);
     for (const fn of analysis.functions) {
+      // 行レベルのコメント可否: 関数の行範囲 ∩ patch のコメント可能行。
+      // diff 外のファイル、変更ファイル内でも関数範囲に diff の行がなければ空になる
+      const { lines, commentLine } = patchLines
+        ? commentableLinesForRange(patchLines, fn.startLine, fn.endLine)
+        : { lines: [] as number[], commentLine: undefined };
       nodes.push({
         id: nodeId(path, fn.name, fn.startLine),
         name: fn.name,
@@ -484,6 +508,8 @@ function assembleGraph(
         endLine: fn.endLine,
         kind: fn.kind,
         inDiff: changedSet.has(path),
+        commentableLines: lines,
+        commentLine,
         sourceText: fn.sourceText,
       });
       if (fn.kind === 'method_definition') {

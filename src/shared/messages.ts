@@ -7,6 +7,7 @@ import type {
   GithubResult,
   PrFilesPayload,
   PrInfo,
+  ReviewCommentPayload,
 } from './github';
 import type { GraphPayload } from './graph';
 
@@ -61,6 +62,24 @@ export interface BuildGraphRequest {
   pr: PrRef;
 }
 
+/**
+ * PR にレビューコメントを投稿する（Phase 5）。
+ * line は patch の RIGHT サイド（head）に含まれる行であること（GraphNode.commentableLines）。
+ * PAT 未設定時は kind: 'pat_required' のエラーが返る（UI 側のボタン無効化と二重防御）。
+ */
+export interface PostReviewCommentRequest {
+  type: 'POST_REVIEW_COMMENT';
+  pr: PrRef;
+  /** コメントを紐づけるコミット SHA（解析に使った headSha） */
+  commitId: string;
+  /** リポジトリルートからのファイルパス */
+  path: string;
+  /** RIGHT サイドの行番号（1 始まり） */
+  line: number;
+  /** コメント本文（Markdown） */
+  body: string;
+}
+
 /** PAT の有効性確認。PAT があれば GET /user、なければ GET /rate_limit */
 export interface TestAuthRequest {
   type: 'TEST_AUTH';
@@ -78,6 +97,7 @@ export type RequestMessage =
   | GetPrFilesRequest
   | GetFileContentRequest
   | BuildGraphRequest
+  | PostReviewCommentRequest
   | TestAuthRequest
   | OpenOptionsRequest;
 
@@ -92,11 +112,13 @@ export type ResponseFor<M extends RequestMessage> = M extends PingRequest
         ? GithubResult<FileContentPayload>
         : M extends BuildGraphRequest
           ? GithubResult<GraphPayload>
-          : M extends TestAuthRequest
-            ? GithubResult<AuthTestPayload>
-            : M extends OpenOptionsRequest
-              ? { ok: true }
-              : never;
+          : M extends PostReviewCommentRequest
+            ? GithubResult<ReviewCommentPayload>
+            : M extends TestAuthRequest
+              ? GithubResult<AuthTestPayload>
+              : M extends OpenOptionsRequest
+                ? { ok: true }
+                : never;
 
 /** 型付き sendMessage ラッパ。SW 休止からの再起動も chrome 側が面倒を見る */
 export function sendToBackground<M extends RequestMessage>(

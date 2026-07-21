@@ -8,6 +8,7 @@ import { describeGithubError } from '../shared/github';
 import type { FunctionGraph, GraphNode } from '../shared/graph';
 import type { PrRef } from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
+import { getPat, PAT_KEY } from '../shared/settings';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
 import type { GraphRenderer, RenderHandle } from './mermaid-view';
@@ -118,9 +119,13 @@ const PANEL_CSS = `
   height: 14px;
   border-radius: 3px;
 }
-.legend-chip.chip-in-diff {
+.legend-chip.chip-commentable {
   background: #dafbe1;
   border: 2px solid #1a7f37;
+}
+.legend-chip.chip-in-diff {
+  background: #fff8c5;
+  border: 1px solid #9a6700;
 }
 .legend-chip.chip-dep {
   background: #f6f8fa;
@@ -265,21 +270,74 @@ const PANEL_CSS = `
   border-radius: 6px;
   resize: vertical;
 }
+.comment-target {
+  margin: 0 0 6px;
+  color: #59636e;
+}
+.comment-line-select {
+  margin-left: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid rgba(140, 149, 159, 0.5);
+  border-radius: 6px;
+  padding: 1px 4px;
+}
+.comment-line-select option {
+  color: initial;
+}
 .comment-submit {
   margin-top: 6px;
   padding: 4px 12px;
   font-size: 12px;
   font-weight: 500;
-  border: 1px solid rgba(140, 149, 159, 0.5);
+  border: 1px solid rgba(31, 136, 61, 0.6);
   border-radius: 6px;
+  background: #1f883d;
+  color: #ffffff;
+  cursor: pointer;
+}
+.comment-submit:disabled {
+  border-color: rgba(140, 149, 159, 0.5);
   background: rgba(140, 149, 159, 0.15);
   color: #59636e;
   cursor: not-allowed;
+}
+.comment-status {
+  margin: 6px 0 0;
+}
+.comment-status[data-state="posting"] { color: #59636e; }
+.comment-status[data-state="ok"] { color: #1a7f37; }
+.comment-status[data-state="error"] { color: #d1242f; }
+@media (prefers-color-scheme: dark) {
+  .comment-status[data-state="posting"] { color: #9198a1; }
+  .comment-status[data-state="ok"] { color: #3fb950; }
+  .comment-status[data-state="error"] { color: #f85149; }
+}
+.comment-status a {
+  color: #0969da;
+}
+@media (prefers-color-scheme: dark) {
+  .comment-status a { color: #4493f8; }
 }
 .comment-note {
   margin: 4px 0 0;
   color: #59636e;
 }
+.comment-auth {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  color: #9a6700;
+  background: rgba(212, 167, 44, 0.15);
+  border: 1px solid rgba(212, 167, 44, 0.4);
+  border-radius: 6px;
+}
+.comment-auth[data-visible="true"] { display: flex; }
 .comment-disabled {
   margin: 0;
   padding: 6px 8px;
@@ -289,7 +347,9 @@ const PANEL_CSS = `
   border-radius: 6px;
 }
 @media (prefers-color-scheme: dark) {
+  .comment-target { color: #9198a1; }
   .comment-note { color: #9198a1; }
+  .comment-auth { color: #d29922; }
   .comment-disabled { color: #d29922; }
 }
 .in-diff-badge {
@@ -331,8 +391,23 @@ let nodeCountEl: HTMLElement | null = null;
 let currentPr: PrRef | null = null;
 
 let currentGraph: FunctionGraph | null = null;
+/** 解析に使った head コミット SHA（コメント投稿の commit_id に使う） */
+let currentHeadSha: string | null = null;
 let selectedNode: GraphNode | null = null;
 let renderHandle: RenderHandle | null = null;
+// PAT が設定されているか（コメント投稿ボタンの活性条件）。
+// パネルを開いたときに読み、storage.onChanged で追従する
+// （パネルの「PAT を設定する」から options で保存 → 戻るとボタンが自動で活きる）
+let patConfigured = false;
+// 表示中のコメントフォームの状態更新関数（PAT 設定変更時に呼ぶ）
+let commentUiUpdater: (() => void) | null = null;
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !(PAT_KEY in changes)) return;
+  const v = changes[PAT_KEY].newValue as unknown;
+  patConfigured = typeof v === 'string' && v.length > 0;
+  commentUiUpdater?.();
+});
 // フィルタ初期値: 孤立ノード（エッジなし）が多いグラフでも見やすいよう、
 // 「エッジのあるノードのみ」をデフォルト ON にする
 let graphFilter: GraphFilter = { connectedOnly: true, inDiffOnly: false };
@@ -483,7 +558,8 @@ function buildPanel(): HTMLElement {
   const legend = document.createElement('span');
   legend.className = 'legend';
   legend.append(
-    createLegendItem('chip-in-diff', '変更ファイル内（Phase 5 でコメント可）'),
+    createLegendItem('chip-commentable', 'コメント可（diff の行）'),
+    createLegendItem('chip-in-diff', '変更ファイル内（関数は無変更）'),
     createLegendItem('chip-dep', '依存先（diff 外）')
   );
   toolbar.append(legend);
@@ -521,6 +597,7 @@ function buildPanel(): HTMLElement {
 
 function renderSidePlaceholder(): void {
   if (!sidePaneEl) return;
+  commentUiUpdater = null;
   const p = document.createElement('p');
   p.className = 'side-placeholder';
   p.textContent = 'グラフのノードをクリックすると、関数の詳細をここに表示します。';
@@ -564,29 +641,143 @@ function renderNodeDetail(node: GraphNode): void {
   commentLabel.className = 'comment-label';
   commentLabel.textContent = 'レビューコメント';
   commentArea.appendChild(commentLabel);
-  if (node.inDiff) {
-    // Phase 5 で投稿機能を実装するまでのプレースホルダ UI
-    const input = document.createElement('textarea');
-    input.className = 'comment-input';
-    input.placeholder = 'この関数へのレビューコメント…';
-    const submit = document.createElement('button');
-    submit.className = 'comment-submit';
-    submit.type = 'button';
-    submit.disabled = true;
-    submit.textContent = 'コメント投稿';
-    const note = document.createElement('p');
-    note.className = 'comment-note';
-    note.textContent = 'コメント投稿は Phase 5 で実装予定です。';
-    commentArea.append(input, submit, note);
+  commentUiUpdater = null;
+  if (node.commentableLines.length > 0) {
+    commentArea.appendChild(buildCommentForm(node));
   } else {
     const disabled = document.createElement('p');
     disabled.className = 'comment-disabled';
-    disabled.textContent =
-      'diff 外のためコメント不可（GitHub は diff に含まれる行にのみコメントできます）';
+    disabled.textContent = node.inDiff
+      ? '関数は変更されていません（diff に含まれる行がないためコメントできません）'
+      : 'diff 外のためコメント不可（GitHub は diff に含まれる行にのみコメントできます）';
     commentArea.appendChild(disabled);
   }
 
   sidePaneEl.replaceChildren(titleRow, location, meta, source, commentArea);
+}
+
+/**
+ * コメント可能ノード用の投稿フォームを組み立てる。
+ * - 対象行の表示（commentableLines が複数なら select で選択可能。既定は commentLine =
+ *   関数範囲内の最初の追加行、なければ最初のコメント可能行）
+ * - 投稿ボタンは「PAT 設定済み かつ 本文が空でない」ときだけ活性
+ *   （PAT 未設定時は background 側でも pat_required で拒否する二重防御）
+ * - 成功時は作成されたコメントの html_url リンク、失敗時は人間可読エラーを表示
+ */
+function buildCommentForm(node: GraphNode): HTMLElement {
+  const form = document.createElement('div');
+  form.className = 'comment-form';
+
+  const defaultLine = node.commentLine ?? node.commentableLines[0];
+  let selectedLine = defaultLine;
+
+  const target = document.createElement('p');
+  target.className = 'comment-target';
+  const targetText = document.createElement('span');
+  const renderTargetText = (): void => {
+    targetText.textContent = `${node.filePath} の L${selectedLine} にコメントされます`;
+  };
+  renderTargetText();
+  target.appendChild(targetText);
+  if (node.commentableLines.length > 1) {
+    const select = document.createElement('select');
+    select.className = 'comment-line-select';
+    select.setAttribute('aria-label', 'コメント先の行を選択');
+    for (const line of node.commentableLines) {
+      const option = document.createElement('option');
+      option.value = String(line);
+      option.textContent = `L${line}`;
+      option.selected = line === defaultLine;
+      select.appendChild(option);
+    }
+    select.addEventListener('change', () => {
+      selectedLine = Number(select.value);
+      renderTargetText();
+    });
+    target.appendChild(select);
+  }
+
+  const input = document.createElement('textarea');
+  input.className = 'comment-input';
+  input.placeholder = 'この関数へのレビューコメント…（Markdown 可）';
+
+  const submit = document.createElement('button');
+  submit.className = 'comment-submit';
+  submit.type = 'button';
+  submit.textContent = 'コメント投稿';
+
+  const authNotice = document.createElement('div');
+  authNotice.className = 'comment-auth';
+  const authText = document.createElement('span');
+  authText.textContent = 'コメント投稿には PAT が必要です。';
+  const openOptions = document.createElement('button');
+  openOptions.className = 'open-options';
+  openOptions.type = 'button';
+  openOptions.textContent = 'PAT を設定する';
+  openOptions.addEventListener('click', () => {
+    void sendToBackground({ type: 'OPEN_OPTIONS' });
+  });
+  authNotice.append(authText, openOptions);
+
+  const status = document.createElement('p');
+  status.className = 'comment-status';
+
+  let posting = false;
+  const update = (): void => {
+    submit.disabled = posting || !patConfigured || input.value.trim() === '';
+    submit.textContent = posting ? '投稿中…' : 'コメント投稿';
+    authNotice.dataset.visible = patConfigured ? 'false' : 'true';
+  };
+  input.addEventListener('input', update);
+
+  submit.addEventListener('click', () => {
+    if (posting || !currentPr || !currentHeadSha) return;
+    const body = input.value.trim();
+    if (body === '') return;
+    posting = true;
+    status.dataset.state = 'posting';
+    status.textContent = '投稿中…';
+    update();
+    void sendToBackground({
+      type: 'POST_REVIEW_COMMENT',
+      pr: currentPr,
+      commitId: currentHeadSha,
+      path: node.filePath,
+      line: selectedLine,
+      body,
+    })
+      .then((res) => {
+        posting = false;
+        if (!form.isConnected) return; // 投稿中にノード切替 / パネルが閉じられた
+        if (res.ok) {
+          status.dataset.state = 'ok';
+          status.textContent = 'コメントを投稿しました: ';
+          const link = document.createElement('a');
+          link.href = res.value.htmlUrl;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = 'PR で見る';
+          status.appendChild(link);
+          input.value = '';
+        } else {
+          status.dataset.state = 'error';
+          status.textContent = describeGithubError(res.error);
+        }
+        update();
+      })
+      .catch((e: unknown) => {
+        posting = false;
+        if (!form.isConnected) return;
+        status.dataset.state = 'error';
+        status.textContent = `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`;
+        update();
+      });
+  });
+
+  commentUiUpdater = update;
+  update();
+  form.append(target, input, submit, authNotice, status);
+  return form;
 }
 
 function selectNode(node: GraphNode | null): void {
@@ -647,7 +838,8 @@ async function loadGraph(pr: PrRef): Promise<void> {
       statusEl.textContent = describeGithubError(res.error);
       return;
     }
-    const { graph, fromCache } = res.value;
+    const { graph, headSha, fromCache } = res.value;
+    currentHeadSha = headSha;
     statusEl.dataset.state = 'ok';
     statusEl.textContent =
       `関数 ${graph.nodes.length} / 呼び出し ${graph.edges.length} / ` +
@@ -669,7 +861,13 @@ function openPanel(): void {
   graphFilter = { connectedOnly: true, inDiffOnly: false };
   selectedNode = null;
   currentGraph = null;
+  currentHeadSha = null;
   renderHandle = null;
+  // コメント投稿ボタンの活性条件。以後の変更は storage.onChanged が追従する
+  void getPat().then((pat) => {
+    patConfigured = pat !== null;
+    commentUiUpdater?.();
+  });
   panelHost = buildPanel();
   // トグルボタンを覆ってしまわないよう、パネルはボタンの下端から開く
   const button = document.getElementById(BUTTON_ID);
@@ -690,8 +888,10 @@ function closePanel(): void {
   sidePaneEl = null;
   nodeCountEl = null;
   currentGraph = null;
+  currentHeadSha = null;
   selectedNode = null;
   renderHandle = null;
+  commentUiUpdater = null;
   renderToken++;
 }
 

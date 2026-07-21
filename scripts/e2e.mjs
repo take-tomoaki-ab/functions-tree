@@ -12,9 +12,17 @@
 // - パネルを閉じて開き直すと SW メモリキャッシュから返る（「（キャッシュ）」表示）
 //
 // Phase 4 で追加した確認項目:
-// - パネルに mermaid の SVG グラフが描画される（inDiff / 依存先の色分けクラス + 凡例）
+// - パネルに mermaid の SVG グラフが描画される（色分けクラス + 凡例）
 // - ノードクリックでサイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）が出る
 // - フィルタトグル（エッジのあるノードのみ）で表示ノード数が切り替わる
+//
+// Phase 5 で追加した確認項目:
+// - 色分けが行レベル判定（commentable / inDiff / dep の 3 区分 + 凡例 3 項目）になる
+// - コメント可能ノード: 対象行の表示 + 未認証ではボタン無効 + PAT 導線
+// - コメント不可ノード: 理由の表示（diff 外 / 関数無変更）
+// - PAT 未設定での投稿要求は background が pat_required で拒否（二重防御）
+// - ダミー PAT 保存 → ボタンが自動で活性化し、投稿実行で 401 が人間可読で表示される
+//   （実 PR への投稿はされない。無効 PAT のため GitHub 側で拒否される）
 //
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
@@ -128,6 +136,8 @@ try {
         status: (shadow?.querySelector('.status')?.textContent ?? '').trim(),
         svgCount: shadow?.querySelectorAll('.graph-area svg').length ?? 0,
         nodeCount: shadow?.querySelectorAll('.graph-area g.node').length ?? 0,
+        commentableNodeCount:
+          shadow?.querySelectorAll('.graph-area g.node.commentable').length ?? 0,
         inDiffNodeCount: shadow?.querySelectorAll('.graph-area g.node.inDiff').length ?? 0,
         depNodeCount: shadow?.querySelectorAll('.graph-area g.node.dep').length ?? 0,
         legendCount: shadow?.querySelectorAll('.legend-item').length ?? 0,
@@ -150,11 +160,14 @@ try {
     panel1.svgCount === 1 && panel1.nodeCount > 0,
     `svg=${panel1.svgCount} nodes=${panel1.nodeCount} (${panel1.countText})`
   );
+  // コメント可ノードの存在は全ノード表示（フィルタ OFF 後の 6.5）で確認する
+  // （この PR の変更行を含む関数は孤立ノードで、デフォルトフィルタでは非表示のため）
   record(
-    'panel: inDiff/dep color classes + legend',
-    panel1.inDiffNodeCount + panel1.depNodeCount === panel1.nodeCount &&
-      panel1.inDiffNodeCount > 0 && panel1.legendCount === 2,
-    `inDiff=${panel1.inDiffNodeCount} dep=${panel1.depNodeCount} legend=${panel1.legendCount}`
+    'panel: commentable/inDiff/dep color classes + legend (line-level)',
+    panel1.commentableNodeCount + panel1.inDiffNodeCount + panel1.depNodeCount ===
+      panel1.nodeCount && panel1.legendCount === 3,
+    `commentable=${panel1.commentableNodeCount} inDiff=${panel1.inDiffNodeCount} ` +
+      `dep=${panel1.depNodeCount} legend=${panel1.legendCount}`
   );
   const authNoticeVisible = await page.evaluate(() => {
     const el = document.querySelector('#functions-tree-panel-host')
@@ -166,21 +179,34 @@ try {
   await shot(page, '3-panel-mermaid-graph');
 
   // 5. ノードクリックでサイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）が出ること
+  const readDetail = () =>
+    page.evaluate(() => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      return {
+        name: (shadow?.querySelector('.detail-name')?.textContent ?? '').trim(),
+        meta: (shadow?.querySelector('.detail-meta')?.textContent ?? '').trim(),
+        sourceLength: (shadow?.querySelector('.source code')?.textContent ?? '').length,
+        selectedCount: shadow?.querySelectorAll('.graph-area g.node.selected').length ?? 0,
+        commentTarget: (shadow?.querySelector('.comment-target')?.textContent ?? '').trim(),
+        hasCommentInput: !!shadow?.querySelector('.comment-input'),
+        submitDisabled: shadow?.querySelector('.comment-submit')?.disabled ?? null,
+        authNoticeVisible: (() => {
+          const el = shadow?.querySelector('.comment-auth');
+          return !!el && getComputedStyle(el).display !== 'none' &&
+            !!el.querySelector('.open-options');
+        })(),
+        disabledReason: (shadow?.querySelector('.comment-disabled')?.textContent ?? '').trim(),
+      };
+    });
+
   await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
-  const detail = await page.evaluate(() => {
-    const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
-    return {
-      name: (shadow?.querySelector('.detail-name')?.textContent ?? '').trim(),
-      meta: (shadow?.querySelector('.detail-meta')?.textContent ?? '').trim(),
-      sourceLength: (shadow?.querySelector('.source code')?.textContent ?? '').length,
-      hasCommentUi: !!shadow?.querySelector('.comment-input, .comment-disabled'),
-      selectedCount: shadow?.querySelectorAll('.graph-area g.node.selected').length ?? 0,
-    };
-  });
+  const detail = await readDetail();
   record(
     'node click: side pane shows function detail with source',
     detail.name !== '' && /:\d+-\d+$/.test(detail.meta) &&
-      detail.sourceLength > 0 && detail.hasCommentUi && detail.selectedCount === 1,
+      detail.sourceLength > 0 &&
+      (detail.hasCommentInput || detail.disabledReason !== '') &&
+      detail.selectedCount === 1,
     `name=${detail.name} meta=${detail.meta} sourceLen=${detail.sourceLength} selected=${detail.selectedCount}`
   );
   await shot(page, '4-node-detail-source');
@@ -201,7 +227,43 @@ try {
     panelAll.nodeCount > panel1.nodeCount,
     `connectedOnly=${panel1.nodeCount} -> all=${panelAll.nodeCount} (${panelAll.countText})`
   );
+  record(
+    'all nodes view: commentable node exists (line-level mapping)',
+    panelAll.commentableNodeCount > 0,
+    `commentable=${panelAll.commentableNodeCount} / ${panelAll.nodeCount}`
+  );
   await shot(page, '5-filter-all-nodes');
+
+  // 6.3. コメント可能ノード: 対象行の表示 + 未認証ではボタン無効 + PAT 導線
+  await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
+  const cDetail = await readDetail();
+  record(
+    'commentable node: target line shown + submit disabled + PAT link (anonymous)',
+    cDetail.hasCommentInput && cDetail.commentTarget.includes('にコメントされます') &&
+      cDetail.submitDisabled === true && cDetail.authNoticeVisible,
+    `target="${cDetail.commentTarget}" disabled=${cDetail.submitDisabled} authNotice=${cDetail.authNoticeVisible}`
+  );
+  await shot(page, '5b-commentable-node-anonymous');
+
+  // 6.5. コメント不可ノード（diff 外 / 関数無変更）で理由が表示されること
+  const nonCommentable = page.locator(
+    '#functions-tree-panel-host .graph-area g.node:not(.commentable)'
+  );
+  if ((await nonCommentable.count()) > 0) {
+    await nonCommentable.first().click();
+    const ncDetail = await readDetail();
+    record(
+      'non-commentable node: reason shown, no comment form',
+      (ncDetail.disabledReason.includes('関数は変更されていません') ||
+        ncDetail.disabledReason.includes('diff 外のためコメント不可')) &&
+        !ncDetail.hasCommentInput,
+      `reason="${ncDetail.disabledReason}"`
+    );
+    await shot(page, '5c-non-commentable-reason');
+  } else {
+    record('non-commentable node: reason shown, no comment form', false,
+      'この PR には コメント不可ノードがない（別の PR で確認要）');
+  }
 
   // 7. 閉じて開き直すと SW メモリキャッシュから返ること（レート制限を消費しない）
   await page.locator(BUTTON).click(); // close
@@ -313,6 +375,108 @@ try {
   const cleared = await optionsPage.evaluate(() => chrome.storage.local.get('githubPat'));
   record('options: PAT deleted from chrome.storage.local', cleared.githubPat === undefined);
   await shot(optionsPage, '11-options-pat-deleted');
+
+  // === Phase 5: レビューコメント投稿（実 PR には投稿されない検証のみ） ===
+
+  // 14. PAT 未設定での投稿要求は background が pat_required で拒否すること（二重防御）
+  const patRequired = await optionsPage.evaluate(
+    ([owner, name]) =>
+      chrome.runtime.sendMessage({
+        type: 'POST_REVIEW_COMMENT',
+        pr: { owner, repo: name, pr: 1 },
+        commitId: 'deadbeef',
+        path: 'src/x.ts',
+        line: 1,
+        body: 'e2e: should be rejected before reaching GitHub',
+      }),
+    repo.split('/')
+  );
+  record(
+    'comment: post without PAT -> pat_required (no API call)',
+    patRequired?.ok === false && patRequired?.error?.kind === 'pat_required',
+    JSON.stringify(patRequired?.error ?? patRequired)
+  );
+
+  // 15. PR ページでパネルを開き直し（未認証・SW キャッシュ）、フィルタを外して
+  //     コメント可能ノードを選択。本文を入れてもボタンは無効のまま（PAT 未設定）
+  await page.bringToFront();
+  await page.locator(BUTTON).click();
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  // コメント可能ノードが孤立ノードのことがあるため、全ノード表示に切り替える
+  await page.locator('#functions-tree-panel-host .filter-connected').click();
+  await page
+    .locator('#functions-tree-panel-host .graph-area g.node.commentable')
+    .first()
+    .waitFor({ timeout: 30_000 });
+  await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
+  const commentText = 'e2e dummy comment（無効 PAT のため実投稿はされない）';
+  await page.locator('#functions-tree-panel-host .comment-input').fill(commentText);
+  const beforePat = await readDetail();
+  record(
+    'comment: body filled but submit still disabled without PAT',
+    beforePat.submitDisabled === true && beforePat.authNoticeVisible,
+    `disabled=${beforePat.submitDisabled} authNotice=${beforePat.authNoticeVisible}`
+  );
+  await shot(page, '12-comment-disabled-no-pat');
+
+  // 16. 別タブの options でダミー PAT を保存 → storage.onChanged でボタンが自動活性化すること
+  await optionsPage.fill('#pat-input', DUMMY_PAT);
+  await optionsPage.click('#save');
+  await optionsPage.waitForFunction(
+    () => (document.querySelector('#pat-status')?.textContent ?? '').includes('保存済み'),
+    undefined,
+    { timeout: 10_000 }
+  );
+  await page.bringToFront();
+  await page.waitForFunction(
+    () => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      const submit = shadow?.querySelector('.comment-submit');
+      return !!submit && submit.disabled === false;
+    },
+    undefined,
+    { timeout: 10_000 }
+  );
+  const afterPat = await readDetail();
+  record(
+    'comment: submit auto-enabled after PAT saved (storage.onChanged)',
+    afterPat.submitDisabled === false && !afterPat.authNoticeVisible &&
+      afterPat.commentTarget.includes('にコメントされます'),
+    `disabled=${afterPat.submitDisabled} target="${afterPat.commentTarget}"`
+  );
+  await shot(page, '13-comment-enabled-with-pat');
+
+  // 17. 投稿実行 → 無効 PAT なので 401 が人間可読で表示されること（実投稿はされない）
+  await page.locator('#functions-tree-panel-host .comment-submit').click();
+  await page.waitForFunction(
+    () => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      const el = shadow?.querySelector('.comment-status');
+      return !!el && el.dataset.state !== 'posting' && (el.textContent ?? '') !== '';
+    },
+    undefined,
+    { timeout: 30_000 }
+  );
+  const postResult = await page.evaluate(() => {
+    const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+    const el = shadow?.querySelector('.comment-status');
+    return { state: el?.dataset.state ?? '', text: (el?.textContent ?? '').trim() };
+  });
+  record(
+    'comment: post with invalid PAT -> human-readable 401 error',
+    postResult.state === 'error' && postResult.text.includes('PAT が無効'),
+    `state=${postResult.state} text="${postResult.text}"`
+  );
+  await shot(page, '14-comment-post-401');
+
+  // 後始末: ダミー PAT を削除
+  await optionsPage.click('#delete');
+  await optionsPage.waitForFunction(
+    () => (document.querySelector('#pat-status')?.textContent ?? '').includes('未設定'),
+    undefined,
+    { timeout: 10_000 }
+  );
 } catch (e) {
   record('e2e run', false, e.message);
 } finally {

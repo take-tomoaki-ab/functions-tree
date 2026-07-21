@@ -3,7 +3,13 @@
 
 import type { PongResponse, RequestMessage } from '../shared/messages';
 import { buildGraphForPr } from './analyzer';
-import { getFileContent, getPrFiles, getPrInfo, testAuth } from './github-api';
+import {
+  getFileContent,
+  getPrFiles,
+  getPrInfo,
+  postReviewComment,
+  testAuth,
+} from './github-api';
 
 // MV3 の注意: 非同期に応答する場合は listener から true を返して
 // sendResponse を後から呼ぶ。false を返すと応答チャネルが即座に閉じる。
@@ -36,6 +42,15 @@ chrome.runtime.onMessage.addListener(
       }
       case 'BUILD_GRAPH': {
         void buildGraphForPr(message.pr).then(sendResponse);
+        return true;
+      }
+      case 'POST_REVIEW_COMMENT': {
+        void postReviewComment(message.pr, {
+          commitId: message.commitId,
+          path: message.path,
+          line: message.line,
+          body: message.body,
+        }).then(sendResponse);
         return true;
       }
       case 'TEST_AUTH': {

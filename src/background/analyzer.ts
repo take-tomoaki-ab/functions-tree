@@ -46,9 +46,10 @@ export async function buildGraphForPr(pr: PrRef): Promise<GithubResult<GraphPayl
 
   const filesRes = await getPrFiles(pr);
   if (!filesRes.ok) return filesRes;
-  const changedPaths = filesRes.value.files
+  // patch は行レベルのコメント可否判定（GraphNode.commentableLines）に使う
+  const changedFiles = filesRes.value.files
     .filter((f) => f.status !== 'removed' && isAnalyzablePath(f.path))
-    .map((f) => f.path);
+    .map((f) => ({ path: f.path, patch: f.patch }));
 
   let analyzer: Analyzer;
   try {
@@ -74,7 +75,7 @@ export async function buildGraphForPr(pr: PrRef): Promise<GithubResult<GraphPayl
     return { ok: false, reason: r.error.kind };
   };
 
-  const graph = await buildGraph(analyzer, changedPaths, fetchFile);
+  const graph = await buildGraph(analyzer, changedFiles, fetchFile);
   if (rateLimitError && graph.analyzedFiles.length === 0) {
     return rateLimitError;
   }

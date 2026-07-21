@@ -17,10 +17,18 @@ export interface GraphNode {
   /** function_declaration | variable_declarator | method_definition */
   kind: string;
   /**
-   * PR の変更ファイル内の関数なら true。
-   * Phase 5 でレビューコメント可否（diff 内の行のみコメント可能）の区別に使う。
+   * PR の変更ファイル内の関数なら true（ファイル単位の判定）。
+   * 行レベルのコメント可否は commentableLines を見ること。
    */
   inDiff: boolean;
+  /**
+   * 関数の行範囲のうち、レビューコメントを付けられる行（patch の RIGHT サイドに
+   * 含まれる行）。昇順。空 = この関数にはコメントできない
+   * （diff 外、または変更ファイル内だが関数自体は無変更）。
+   */
+  commentableLines: number[];
+  /** 推奨コメント行（範囲内の最初の追加行、なければ最初のコメント可能行） */
+  commentLine?: number;
   /** 関数定義のソーステキスト（Phase 4 のサイドパネル表示用） */
   sourceText: string;
 }

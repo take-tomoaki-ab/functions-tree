@@ -40,8 +40,10 @@ async function fetchFixture(path) {
   }
 }
 
-async function buildFixtureGraph(changedPaths, options) {
-  return buildGraph(analyzer, changedPaths, fetchFixture, options);
+/** 変更ファイルはパス文字列 or { path, patch } で指定できるようにする */
+async function buildFixtureGraph(changedFiles, options) {
+  const inputs = changedFiles.map((f) => (typeof f === 'string' ? { path: f } : f));
+  return buildGraph(analyzer, inputs, fetchFixture, options);
 }
 
 const findNode = (graph, name) => graph.nodes.find((n) => n.name === name);
@@ -239,7 +241,11 @@ describe('buildGraph: グラフ組み立て', () => {
       if (path === 'huge.ts') return { ok: false, reason: 'too_large' };
       return fetchFixture(path);
     };
-    const graph = await buildGraph(analyzer, ['app.ts', 'huge.ts'], fetchWithError);
+    const graph = await buildGraph(
+      analyzer,
+      [{ path: 'app.ts' }, { path: 'huge.ts' }],
+      fetchWithError
+    );
     assert.deepEqual(
       graph.skippedFiles.filter((s) => s.path === 'huge.ts'),
       [{ path: 'huge.ts', reason: 'too_large' }]
@@ -269,6 +275,59 @@ describe('buildGraph: グラフ組み立て', () => {
     assert.ok(graph.skippedFiles.some((s) => s.reason === 'dependency_limit'));
     // 変更ファイル + 依存 1 件のみ
     assert.equal(graph.analyzedFiles.length, 2);
+  });
+
+  test('patch から行レベルのコメント可否がノードに載る（推奨行は最初の追加行）', async () => {
+    // app.ts の main（9-17 行）に掛かる hunk。RIGHT: 8-10 文脈 / 11 追加 / 12 文脈
+    const patch = [
+      '@@ -8,4 +8,5 @@',
+      ' ',
+      ' export function main(): void {',
+      "   const message = toUpper('hello');",
+      '+  shorten(message);',
+      '   logger.write(message);',
+    ].join('\n');
+    const graph = await buildFixtureGraph([{ path: 'app.ts', patch }]);
+
+    const main = findNode(graph, 'main');
+    assert.equal(main.inDiff, true);
+    assert.deepEqual(main.commentableLines, [9, 10, 11, 12]);
+    assert.equal(main.commentLine, 11, '関数範囲内の最初の追加行');
+
+    // 変更ファイル内でも、diff に掛からない関数（render: 19-24 行）はコメント不可
+    const render = findNode(graph, 'render');
+    assert.equal(render.inDiff, true);
+    assert.deepEqual(render.commentableLines, []);
+    assert.equal(render.commentLine, undefined);
+
+    // diff 外の依存ファイル（util.ts）の関数もコメント不可
+    const toUpper = findNode(graph, 'toUpper');
+    assert.equal(toUpper.inDiff, false);
+    assert.deepEqual(toUpper.commentableLines, []);
+  });
+
+  test('範囲内に追加行がなければ推奨行は文脈行にフォールバックする', async () => {
+    // render（19-24 行）に掛かる削除のみの hunk。RIGHT: 20-21 は文脈行
+    const patch = [
+      '@@ -20,3 +20,2 @@',
+      ' function render(): void {',
+      '-  // removed comment',
+      '   const items = [1, 2, 3].map((n) => toUpper(String(n)));',
+    ].join('\n');
+    const graph = await buildFixtureGraph([{ path: 'app.ts', patch }], {
+      dependencyDepth: 0,
+    });
+    const render = findNode(graph, 'render');
+    assert.deepEqual(render.commentableLines, [20, 21]);
+    assert.equal(render.commentLine, 20, '追加行がないので最初の文脈行');
+  });
+
+  test('patch のない変更ファイル（バイナリ / 巨大）は全関数がコメント不可', async () => {
+    const graph = await buildFixtureGraph(['app.ts'], { dependencyDepth: 0 });
+    for (const node of graph.nodes) {
+      assert.deepEqual(node.commentableLines, []);
+      assert.equal(node.commentLine, undefined);
+    }
   });
 
   test('ノード ID は filePath#name@startLine 形式で一意', async () => {

@@ -10,6 +10,7 @@ import type {
   PrFile,
   PrFilesPayload,
   PrInfo,
+  ReviewCommentPayload,
 } from '../shared/github';
 import type { PrRef } from '../shared/messages';
 import { getPat } from '../shared/settings';
@@ -35,7 +36,11 @@ interface FetchErr {
   error: GithubApiError;
 }
 
-async function apiGet(pathAndQuery: string): Promise<FetchOk | FetchErr> {
+async function apiRequest(
+  method: 'GET' | 'POST',
+  pathAndQuery: string,
+  body?: unknown
+): Promise<FetchOk | FetchErr> {
   const pat = await getPat();
   const authMode: AuthMode = pat ? 'pat' : 'anonymous';
   const headers: Record<string, string> = {
@@ -43,10 +48,15 @@ async function apiGet(pathAndQuery: string): Promise<FetchOk | FetchErr> {
     'X-GitHub-Api-Version': '2022-11-28',
   };
   if (pat) headers['Authorization'] = `Bearer ${pat}`;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
 
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${pathAndQuery}`, { headers });
+    res = await fetch(`${API_BASE}${pathAndQuery}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
   } catch (e) {
     return {
       ok: false,
@@ -58,6 +68,10 @@ async function apiGet(pathAndQuery: string): Promise<FetchOk | FetchErr> {
   return { ok: false, authMode, error: await toApiError(res) };
 }
 
+function apiGet(pathAndQuery: string): Promise<FetchOk | FetchErr> {
+  return apiRequest('GET', pathAndQuery);
+}
+
 async function toApiError(res: Response): Promise<GithubApiError> {
   const status = res.status;
   let message = res.statusText;
@@ -65,6 +79,22 @@ async function toApiError(res: Response): Promise<GithubApiError> {
     const body: unknown = await res.json();
     if (body && typeof body === 'object' && 'message' in body) {
       message = String((body as { message: unknown }).message);
+      // 422 (Validation Failed) 等は errors 配列に具体的な理由が入る
+      const errors = (body as { errors?: unknown }).errors;
+      if (Array.isArray(errors) && errors.length > 0) {
+        const details = errors
+          .map((e) =>
+            e && typeof e === 'object'
+              ? String(
+                  (e as { message?: unknown; code?: unknown }).message ??
+                    (e as { code?: unknown }).code ??
+                    ''
+                )
+              : String(e)
+          )
+          .filter((s) => s.length > 0);
+        if (details.length > 0) message += `（${details.join(' / ')}）`;
+      }
     }
   } catch {
     // body が JSON でなくても statusText で続行
@@ -131,6 +161,7 @@ export async function getPrFiles(pr: PrRef): Promise<GithubResult<PrFilesPayload
       status: string;
       additions: number;
       deletions: number;
+      patch?: string;
     }>;
     for (const f of json) {
       files.push({
@@ -139,6 +170,7 @@ export async function getPrFiles(pr: PrRef): Promise<GithubResult<PrFilesPayload
         status: f.status,
         additions: f.additions,
         deletions: f.deletions,
+        patch: f.patch,
       });
     }
     const hasNext = /(?:^|,)\s*<[^>]+>;\s*rel="next"/.test(r.res.headers.get('link') ?? '');
@@ -192,6 +224,47 @@ export async function getFileContent(
     ok: true,
     authMode: r.authMode,
     value: { path, ref, size: json.size, content: decodeBase64Utf8(json.content) },
+  };
+}
+
+/**
+ * POST /repos/{owner}/{repo}/pulls/{n}/comments — レビューコメント投稿。
+ * line は diff（patch）の RIGHT サイドに含まれる行であること。
+ * PAT 未設定なら API を呼ばずに kind: 'pat_required' を返す
+ * （UI 側のボタン無効化と合わせた二重防御）。
+ */
+export async function postReviewComment(
+  pr: PrRef,
+  params: { commitId: string; path: string; line: number; body: string }
+): Promise<GithubResult<ReviewCommentPayload>> {
+  const pat = await getPat();
+  if (!pat) {
+    return {
+      ok: false,
+      authMode: 'anonymous',
+      error: {
+        kind: 'pat_required',
+        message: 'コメント投稿には PAT の設定が必要です',
+      },
+    };
+  }
+  const r = await apiRequest(
+    'POST',
+    `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/comments`,
+    {
+      body: params.body,
+      commit_id: params.commitId,
+      path: params.path,
+      line: params.line,
+      side: 'RIGHT',
+    }
+  );
+  if (!r.ok) return r;
+  const json = (await r.res.json()) as { html_url: string; id: number };
+  return {
+    ok: true,
+    authMode: r.authMode,
+    value: { htmlUrl: json.html_url, id: json.id },
   };
 }
 

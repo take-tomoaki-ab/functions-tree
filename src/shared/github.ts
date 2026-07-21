@@ -10,6 +10,7 @@ export type GithubErrorKind =
   | 'rate_limited' // 403/429 かつレート残量 0
   | 'not_found' // 404: PR やファイルが存在しない / private で権限なし
   | 'too_large' // contents API の 1MB 上限超え
+  | 'pat_required' // PAT 未設定で書き込み系 API（コメント投稿）を呼ぼうとした
   | 'network' // fetch 自体の失敗（オフライン等）
   | 'unexpected'; // その他
 
@@ -43,6 +44,8 @@ export interface PrFile {
   status: string; // added | removed | modified | renamed | copied | changed | unchanged
   additions: number;
   deletions: number;
+  /** unified diff（コメント可能行の算出に使う）。バイナリ / 巨大ファイルでは無い */
+  patch?: string;
 }
 
 export interface PrFilesPayload {
@@ -57,6 +60,13 @@ export interface FileContentPayload {
   size: number;
   /** base64 デコード済みの UTF-8 テキスト */
   content: string;
+}
+
+/** POST /pulls/{n}/comments の成功応答（UI 表示に必要な分だけ） */
+export interface ReviewCommentPayload {
+  /** 作成されたコメントの PR ページ上の URL */
+  htmlUrl: string;
+  id: number;
 }
 
 export interface AuthTestPayload {
@@ -83,6 +93,8 @@ export function describeGithubError(error: GithubApiError): string {
       return '見つかりませんでした（404）。PR 番号が正しいか、プライベートリポジトリの場合は PAT が設定されているか確認してください。';
     case 'too_large':
       return 'ファイルが大きすぎて取得できません（contents API の 1MB 上限）。';
+    case 'pat_required':
+      return 'コメント投稿には PAT が必要です。設定ページで PAT を設定してください。';
     case 'network':
       return `GitHub API に接続できませんでした: ${error.message}`;
     default:

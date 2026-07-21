@@ -44,10 +44,18 @@ export interface MermaidGraphSource {
   nodeByMermaidId: Map<string, GraphNode>;
 }
 
-/** inDiff ノードに付ける mermaid クラス名（SVG の g.node にもこのクラスが付く） */
+/** コメント可能ノード（diff の行を含む関数）の mermaid クラス名（SVG の g.node にも付く） */
+export const NODE_CLASS_COMMENTABLE = 'commentable';
+/** 変更ファイル内だが関数自体は無変更（コメント不可）のクラス名 */
 export const NODE_CLASS_IN_DIFF = 'inDiff';
 /** diff 外の依存先ノードに付ける mermaid クラス名 */
 export const NODE_CLASS_DEPENDENCY = 'dep';
+
+/** ノードの表示クラス分け: コメント可（行レベル）> 変更ファイル内 > 依存先 */
+export function nodeClassOf(node: GraphNode): string {
+  if (node.commentableLines.length > 0) return NODE_CLASS_COMMENTABLE;
+  return node.inDiff ? NODE_CLASS_IN_DIFF : NODE_CLASS_DEPENDENCY;
+}
 
 // htmlLabels: false でも mermaid は <br/> だけは改行として解釈するため、
 // ラベル本文は実体参照でエスケープした上で <br/> を挟む
@@ -81,8 +89,7 @@ export function buildMermaidSource(graph: FunctionGraph): MermaidGraphSource {
     const label =
       `${escapeLabel(node.name)}<br/>` +
       `${escapeLabel(shortFileName(node.filePath))}:${node.startLine}`;
-    const nodeClass = node.inDiff ? NODE_CLASS_IN_DIFF : NODE_CLASS_DEPENDENCY;
-    lines.push(`  ${mermaidId}["${label}"]:::${nodeClass}`);
+    lines.push(`  ${mermaidId}["${label}"]:::${nodeClassOf(node)}`);
   });
 
   for (const edge of graph.edges) {
@@ -92,7 +99,8 @@ export function buildMermaidSource(graph: FunctionGraph): MermaidGraphSource {
   }
 
   lines.push(
-    `  classDef ${NODE_CLASS_IN_DIFF} fill:#dafbe1,stroke:#1a7f37,stroke-width:2px,color:#116329`,
+    `  classDef ${NODE_CLASS_COMMENTABLE} fill:#dafbe1,stroke:#1a7f37,stroke-width:2px,color:#116329`,
+    `  classDef ${NODE_CLASS_IN_DIFF} fill:#fff8c5,stroke:#9a6700,stroke-width:1px,color:#7d4e00`,
     `  classDef ${NODE_CLASS_DEPENDENCY} fill:#f6f8fa,stroke:#8c959f,stroke-dasharray:4 3,color:#57606a`
   );
   return { source: lines.join('\n'), nodeByMermaidId };
