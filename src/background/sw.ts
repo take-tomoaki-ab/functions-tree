@@ -2,6 +2,7 @@
 // GitHub API 呼び出しは github-api.ts に委譲する。Phase 3 で tree-sitter 解析がここに載る。
 
 import type { PongResponse, RequestMessage } from '../shared/messages';
+import { buildGraphForPr } from './analyzer';
 import { getFileContent, getPrFiles, getPrInfo, testAuth } from './github-api';
 
 // MV3 の注意: 非同期に応答する場合は listener から true を返して
@@ -31,6 +32,10 @@ chrome.runtime.onMessage.addListener(
         void getFileContent(message.owner, message.repo, message.path, message.ref).then(
           sendResponse
         );
+        return true;
+      }
+      case 'BUILD_GRAPH': {
+        void buildGraphForPr(message.pr).then(sendResponse);
         return true;
       }
       case 'TEST_AUTH': {

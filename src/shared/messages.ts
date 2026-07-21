@@ -8,6 +8,7 @@ import type {
   PrFilesPayload,
   PrInfo,
 } from './github';
+import type { GraphPayload } from './graph';
 
 /** PR を一意に指すリファレンス */
 export interface PrRef {
@@ -51,6 +52,15 @@ export interface GetFileContentRequest {
   ref: string;
 }
 
+/**
+ * PR のコールグラフを構築する（Phase 3）。
+ * 解析は SW 内の tree-sitter で行い、結果は headSha をキーに SW メモリにキャッシュされる。
+ */
+export interface BuildGraphRequest {
+  type: 'BUILD_GRAPH';
+  pr: PrRef;
+}
+
 /** PAT の有効性確認。PAT があれば GET /user、なければ GET /rate_limit */
 export interface TestAuthRequest {
   type: 'TEST_AUTH';
@@ -67,6 +77,7 @@ export type RequestMessage =
   | GetPrInfoRequest
   | GetPrFilesRequest
   | GetFileContentRequest
+  | BuildGraphRequest
   | TestAuthRequest
   | OpenOptionsRequest;
 
@@ -79,11 +90,13 @@ export type ResponseFor<M extends RequestMessage> = M extends PingRequest
       ? GithubResult<PrFilesPayload>
       : M extends GetFileContentRequest
         ? GithubResult<FileContentPayload>
-        : M extends TestAuthRequest
-          ? GithubResult<AuthTestPayload>
-          : M extends OpenOptionsRequest
-            ? { ok: true }
-            : never;
+        : M extends BuildGraphRequest
+          ? GithubResult<GraphPayload>
+          : M extends TestAuthRequest
+            ? GithubResult<AuthTestPayload>
+            : M extends OpenOptionsRequest
+              ? { ok: true }
+              : never;
 
 /** 型付き sendMessage ラッパ。SW 休止からの再起動も chrome 側が面倒を見る */
 export function sendToBackground<M extends RequestMessage>(

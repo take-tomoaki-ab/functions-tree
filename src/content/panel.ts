@@ -1,9 +1,9 @@
 // PR ページへのトグルボタン注入と、Shadow DOM に隔離したパネルの開閉。
-// パネルを開くと background 経由で PR の変更ファイル一覧を取得して表示する
-// （Phase 4 でグラフ描画に置き換わるまでの暫定表示 + GitHub API 経路の動作確認を兼ねる）。
+// パネルを開くと background に BUILD_GRAPH を依頼し、コールグラフのサマリと
+// 関数一覧を表示する（Phase 4 で mermaid 描画に置き換わるまでの暫定表示）。
 
-import type { PrFile } from '../shared/github';
 import { describeGithubError } from '../shared/github';
+import type { GraphNode } from '../shared/graph';
 import type { PrRef } from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
 
@@ -117,12 +117,12 @@ const PANEL_CSS = `
 @media (prefers-color-scheme: dark) {
   .open-options { color: #4493f8; }
 }
-.file-list {
+.function-list {
   list-style: none;
   margin: 8px 0 0;
   padding: 0;
 }
-.file-item {
+.function-item {
   display: flex;
   gap: 8px;
   align-items: baseline;
@@ -130,24 +130,40 @@ const PANEL_CSS = `
   border-bottom: 1px solid rgba(140, 149, 159, 0.2);
   font-size: 12px;
 }
-.file-path {
+.function-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.function-file {
   flex: 1;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #59636e;
   word-break: break-all;
 }
-.file-diffstat { white-space: nowrap; }
-.additions { color: #1a7f37; }
-.deletions { color: #d1242f; }
 @media (prefers-color-scheme: dark) {
-  .additions { color: #3fb950; }
-  .deletions { color: #f85149; }
+  .function-file { color: #9198a1; }
+}
+.in-diff-badge {
+  flex-shrink: 0;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #1a7f37;
+  background: rgba(31, 136, 61, 0.15);
+  border: 1px solid rgba(31, 136, 61, 0.4);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+@media (prefers-color-scheme: dark) {
+  .in-diff-badge { color: #3fb950; }
 }
 `;
 
 let panelHost: HTMLElement | null = null;
 let statusEl: HTMLElement | null = null;
 let authNoticeEl: HTMLElement | null = null;
-let fileListEl: HTMLUListElement | null = null;
+let functionListEl: HTMLUListElement | null = null;
 let currentPr: PrRef | null = null;
 
 function isVisible(el: HTMLElement): boolean {
@@ -235,7 +251,7 @@ function buildPanel(): HTMLElement {
   body.className = 'panel-body';
   const placeholder = document.createElement('p');
   placeholder.className = 'placeholder';
-  placeholder.textContent = '変更ファイル一覧（Phase 4 でグラフ表示に置き換え予定）';
+  placeholder.textContent = 'コールグラフ解析結果（Phase 4 で mermaid 描画に置き換え予定）';
 
   authNoticeEl = document.createElement('div');
   authNoticeEl.className = 'auth-notice';
@@ -252,53 +268,60 @@ function buildPanel(): HTMLElement {
 
   statusEl = document.createElement('p');
   statusEl.className = 'status';
-  statusEl.textContent = '変更ファイルを取得中…';
-  fileListEl = document.createElement('ul');
-  fileListEl.className = 'file-list';
-  body.append(placeholder, authNoticeEl, statusEl, fileListEl);
+  statusEl.textContent = 'コールグラフを解析中…';
+  functionListEl = document.createElement('ul');
+  functionListEl.className = 'function-list';
+  body.append(placeholder, authNoticeEl, statusEl, functionListEl);
 
   panel.append(header, body);
   shadow.appendChild(panel);
   return host;
 }
 
-function renderFileItem(file: PrFile): HTMLLIElement {
+function renderFunctionItem(node: GraphNode): HTMLLIElement {
   const li = document.createElement('li');
-  li.className = 'file-item';
-  const path = document.createElement('span');
-  path.className = 'file-path';
-  path.textContent = file.previousPath ? `${file.previousPath} → ${file.path}` : file.path;
-  const diffstat = document.createElement('span');
-  diffstat.className = 'file-diffstat';
-  const additions = document.createElement('span');
-  additions.className = 'additions';
-  additions.textContent = `+${file.additions}`;
-  const deletions = document.createElement('span');
-  deletions.className = 'deletions';
-  deletions.textContent = ` −${file.deletions}`;
-  diffstat.append(additions, deletions);
-  li.append(path, diffstat);
+  li.className = 'function-item';
+  const name = document.createElement('span');
+  name.className = 'function-name';
+  name.textContent = node.name;
+  const file = document.createElement('span');
+  file.className = 'function-file';
+  file.textContent = `${node.filePath}:${node.startLine}`;
+  li.append(name, file);
+  if (node.inDiff) {
+    const badge = document.createElement('span');
+    badge.className = 'in-diff-badge';
+    badge.textContent = 'diff';
+    li.append(badge);
+  }
   return li;
 }
 
-async function loadPrFiles(pr: PrRef): Promise<void> {
-  if (!statusEl || !fileListEl) return;
+async function loadGraph(pr: PrRef): Promise<void> {
+  if (!statusEl || !functionListEl) return;
   delete statusEl.dataset.state;
-  statusEl.textContent = '変更ファイルを取得中…';
+  statusEl.textContent = 'コールグラフを解析中…';
   try {
-    const res = await sendToBackground({ type: 'GET_PR_FILES', pr });
+    const res = await sendToBackground({ type: 'BUILD_GRAPH', pr });
     // パネルが閉じられていたら描画しない
-    if (!statusEl || !fileListEl || !authNoticeEl) return;
+    if (!statusEl || !functionListEl || !authNoticeEl) return;
     authNoticeEl.dataset.visible = res.authMode === 'anonymous' ? 'true' : 'false';
     if (!res.ok) {
       statusEl.dataset.state = 'error';
       statusEl.textContent = describeGithubError(res.error);
       return;
     }
-    const { files, truncated } = res.value;
+    const { graph, fromCache } = res.value;
     statusEl.dataset.state = 'ok';
-    statusEl.textContent = `変更ファイル ${files.length} 件${truncated ? '（上限に達したため一部のみ）' : ''}`;
-    fileListEl.replaceChildren(...files.map(renderFileItem));
+    statusEl.textContent =
+      `関数 ${graph.nodes.length} / 呼び出し ${graph.edges.length} / ` +
+      `解析 ${graph.analyzedFiles.length} ファイル / スキップ ${graph.skippedFiles.length}` +
+      `${fromCache ? '（キャッシュ）' : ''}`;
+    // diff 内の関数を先頭にまとめて表示する
+    const ordered = [...graph.nodes].sort(
+      (a, b) => Number(b.inDiff) - Number(a.inDiff)
+    );
+    functionListEl.replaceChildren(...ordered.map(renderFunctionItem));
   } catch (e) {
     if (!statusEl) return;
     statusEl.dataset.state = 'error';
@@ -316,7 +339,7 @@ function openPanel(): void {
     panelHost.style.setProperty('--functions-tree-panel-top', `${Math.round(bottom) + 8}px`);
   }
   document.body.appendChild(panelHost);
-  void loadPrFiles(currentPr);
+  void loadGraph(currentPr);
 }
 
 function closePanel(): void {
@@ -324,7 +347,7 @@ function closePanel(): void {
   panelHost = null;
   statusEl = null;
   authNoticeEl = null;
-  fileListEl = null;
+  functionListEl = null;
 }
 
 function togglePanel(): void {

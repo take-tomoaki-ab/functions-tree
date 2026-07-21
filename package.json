@@ -1,6 +1,6 @@
 {
   "name": "functions-tree",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "GitHub PR ページ上で関数の依存関係グラフを表示する Chrome 拡張 (MV3)",
@@ -11,13 +11,19 @@
     "bundle:sw": "esbuild src/background/sw.ts --bundle --format=esm --external:module --external:fs --external:path --outfile=dist/sw.js",
     "bundle:options": "esbuild src/options/options.ts --bundle --format=iife --outfile=dist/options.js",
     "copy-static": "cp manifest.json src/options/options.html dist/",
-    "build": "npm run clean && npm run typecheck && npm run bundle:content && npm run bundle:sw && npm run bundle:options && mkdir -p dist && npm run copy-static",
+    "copy-wasm": "mkdir -p dist/wasm && cp node_modules/web-tree-sitter/web-tree-sitter.wasm node_modules/tree-sitter-typescript/tree-sitter-typescript.wasm node_modules/tree-sitter-typescript/tree-sitter-tsx.wasm dist/wasm/",
+    "build": "npm run clean && npm run typecheck && npm run bundle:content && npm run bundle:sw && npm run bundle:options && mkdir -p dist && npm run copy-static && npm run copy-wasm",
+    "pretest": "esbuild src/background/analyzer-core.ts --bundle --format=esm --external:module --external:fs --external:path --external:web-tree-sitter --outfile=dist-test/analyzer-core.mjs",
+    "test": "node --test \"test/**/*.test.mjs\"",
     "e2e": "node scripts/e2e.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.268",
+    "@types/emscripten": "^1.41.5",
     "esbuild": "^0.28.1",
     "playwright": "^1.58.2",
-    "typescript": "^5.5.0"
+    "tree-sitter-typescript": "^0.23.2",
+    "typescript": "^5.5.0",
+    "web-tree-sitter": "^0.26.11"
   }
 }
