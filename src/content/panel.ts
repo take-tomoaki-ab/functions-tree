@@ -1,5 +1,9 @@
 // PR ページへのトグルボタン注入と、Shadow DOM に隔離したパネルの開閉。
+// パネルを開くと background 経由で PR の変更ファイル一覧を取得して表示する
+// （Phase 4 でグラフ描画に置き換わるまでの暫定表示 + GitHub API 経路の動作確認を兼ねる）。
 
+import type { PrFile } from '../shared/github';
+import { describeGithubError } from '../shared/github';
 import type { PrRef } from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
 
@@ -85,10 +89,65 @@ const PANEL_CSS = `
   .status[data-state="ok"] { color: #3fb950; }
   .status[data-state="error"] { color: #f85149; }
 }
+.auth-notice {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: #9a6700;
+  background: rgba(212, 167, 44, 0.15);
+  border: 1px solid rgba(212, 167, 44, 0.4);
+  border-radius: 6px;
+}
+.auth-notice[data-visible="true"] { display: flex; }
+@media (prefers-color-scheme: dark) {
+  .auth-notice { color: #d29922; }
+}
+.open-options {
+  border: none;
+  background: transparent;
+  color: #0969da;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+@media (prefers-color-scheme: dark) {
+  .open-options { color: #4493f8; }
+}
+.file-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+.file-item {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(140, 149, 159, 0.2);
+  font-size: 12px;
+}
+.file-path {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}
+.file-diffstat { white-space: nowrap; }
+.additions { color: #1a7f37; }
+.deletions { color: #d1242f; }
+@media (prefers-color-scheme: dark) {
+  .additions { color: #3fb950; }
+  .deletions { color: #f85149; }
+}
 `;
 
 let panelHost: HTMLElement | null = null;
 let statusEl: HTMLElement | null = null;
+let authNoticeEl: HTMLElement | null = null;
+let fileListEl: HTMLUListElement | null = null;
 let currentPr: PrRef | null = null;
 
 function isVisible(el: HTMLElement): boolean {
@@ -176,31 +235,74 @@ function buildPanel(): HTMLElement {
   body.className = 'panel-body';
   const placeholder = document.createElement('p');
   placeholder.className = 'placeholder';
-  placeholder.textContent = 'グラフは Phase 4 で実装予定です。';
+  placeholder.textContent = '変更ファイル一覧（Phase 4 でグラフ表示に置き換え予定）';
+
+  authNoticeEl = document.createElement('div');
+  authNoticeEl.className = 'auth-notice';
+  const noticeText = document.createElement('span');
+  noticeText.textContent = '未認証モード（レート制限あり）';
+  const openOptions = document.createElement('button');
+  openOptions.className = 'open-options';
+  openOptions.type = 'button';
+  openOptions.textContent = 'PAT を設定する';
+  openOptions.addEventListener('click', () => {
+    void sendToBackground({ type: 'OPEN_OPTIONS' });
+  });
+  authNoticeEl.append(noticeText, openOptions);
+
   statusEl = document.createElement('p');
   statusEl.className = 'status';
-  statusEl.textContent = 'background と疎通確認中…';
-  body.append(placeholder, statusEl);
+  statusEl.textContent = '変更ファイルを取得中…';
+  fileListEl = document.createElement('ul');
+  fileListEl.className = 'file-list';
+  body.append(placeholder, authNoticeEl, statusEl, fileListEl);
 
   panel.append(header, body);
   shadow.appendChild(panel);
   return host;
 }
 
-async function checkBackground(pr: PrRef): Promise<void> {
-  if (!statusEl) return;
+function renderFileItem(file: PrFile): HTMLLIElement {
+  const li = document.createElement('li');
+  li.className = 'file-item';
+  const path = document.createElement('span');
+  path.className = 'file-path';
+  path.textContent = file.previousPath ? `${file.previousPath} → ${file.path}` : file.path;
+  const diffstat = document.createElement('span');
+  diffstat.className = 'file-diffstat';
+  const additions = document.createElement('span');
+  additions.className = 'additions';
+  additions.textContent = `+${file.additions}`;
+  const deletions = document.createElement('span');
+  deletions.className = 'deletions';
+  deletions.textContent = ` −${file.deletions}`;
+  diffstat.append(additions, deletions);
+  li.append(path, diffstat);
+  return li;
+}
+
+async function loadPrFiles(pr: PrRef): Promise<void> {
+  if (!statusEl || !fileListEl) return;
+  delete statusEl.dataset.state;
+  statusEl.textContent = '変更ファイルを取得中…';
   try {
-    const res = await sendToBackground({ type: 'PING', pr });
-    if (res?.type === 'PONG') {
-      statusEl.dataset.state = 'ok';
-      statusEl.textContent = `background 疎通 OK (PONG, ${new Date(res.receivedAt).toLocaleTimeString()})`;
-    } else {
+    const res = await sendToBackground({ type: 'GET_PR_FILES', pr });
+    // パネルが閉じられていたら描画しない
+    if (!statusEl || !fileListEl || !authNoticeEl) return;
+    authNoticeEl.dataset.visible = res.authMode === 'anonymous' ? 'true' : 'false';
+    if (!res.ok) {
       statusEl.dataset.state = 'error';
-      statusEl.textContent = `background から想定外の応答: ${JSON.stringify(res)}`;
+      statusEl.textContent = describeGithubError(res.error);
+      return;
     }
+    const { files, truncated } = res.value;
+    statusEl.dataset.state = 'ok';
+    statusEl.textContent = `変更ファイル ${files.length} 件${truncated ? '（上限に達したため一部のみ）' : ''}`;
+    fileListEl.replaceChildren(...files.map(renderFileItem));
   } catch (e) {
+    if (!statusEl) return;
     statusEl.dataset.state = 'error';
-    statusEl.textContent = `background 疎通失敗: ${e instanceof Error ? e.message : String(e)}`;
+    statusEl.textContent = `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`;
   }
 }
 
@@ -214,13 +316,15 @@ function openPanel(): void {
     panelHost.style.setProperty('--functions-tree-panel-top', `${Math.round(bottom) + 8}px`);
   }
   document.body.appendChild(panelHost);
-  void checkBackground(currentPr);
+  void loadPrFiles(currentPr);
 }
 
 function closePanel(): void {
   panelHost?.remove();
   panelHost = null;
   statusEl = null;
+  authNoticeEl = null;
+  fileListEl = null;
 }
 
 function togglePanel(): void {

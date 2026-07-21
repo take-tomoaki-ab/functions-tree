@@ -1,9 +1,11 @@
 // background service worker。
-// Phase 1 では content script からのメッセージに応答する骨組みのみ。
-// Phase 2 以降で GitHub API 呼び出し、Phase 3 で tree-sitter 解析がここに載る。
+// GitHub API 呼び出しは github-api.ts に委譲する。Phase 3 で tree-sitter 解析がここに載る。
 
-import type { RequestMessage, PongResponse } from '../shared/messages';
+import type { PongResponse, RequestMessage } from '../shared/messages';
+import { getFileContent, getPrFiles, getPrInfo, testAuth } from './github-api';
 
+// MV3 の注意: 非同期に応答する場合は listener から true を返して
+// sendResponse を後から呼ぶ。false を返すと応答チャネルが即座に閉じる。
 chrome.runtime.onMessage.addListener(
   (message: RequestMessage, _sender, sendResponse) => {
     switch (message?.type) {
@@ -11,6 +13,29 @@ chrome.runtime.onMessage.addListener(
         const res: PongResponse = { type: 'PONG', receivedAt: Date.now() };
         sendResponse(res);
         return false; // 同期応答
+      }
+      case 'OPEN_OPTIONS': {
+        void chrome.runtime.openOptionsPage();
+        sendResponse({ ok: true });
+        return false;
+      }
+      case 'GET_PR_INFO': {
+        void getPrInfo(message.pr).then(sendResponse);
+        return true; // 非同期応答
+      }
+      case 'GET_PR_FILES': {
+        void getPrFiles(message.pr).then(sendResponse);
+        return true;
+      }
+      case 'GET_FILE_CONTENT': {
+        void getFileContent(message.owner, message.repo, message.path, message.ref).then(
+          sendResponse
+        );
+        return true;
+      }
+      case 'TEST_AUTH': {
+        void testAuth().then(sendResponse);
+        return true;
       }
       default:
         // 未知のメッセージは応答しない（呼び出し側で undefined になる）

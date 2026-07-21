@@ -1,0 +1,235 @@
+// GitHub REST API クライアント。PAT を扱うため service worker 内でのみ使う。
+// すべての関数は throw せず GithubResult<T> で返す（UI 側は describeGithubError で表示）。
+
+import type {
+  AuthMode,
+  AuthTestPayload,
+  FileContentPayload,
+  GithubApiError,
+  GithubResult,
+  PrFile,
+  PrFilesPayload,
+  PrInfo,
+} from '../shared/github';
+import type { PrRef } from '../shared/messages';
+import { getPat } from '../shared/settings';
+
+const API_BASE = 'https://api.github.com';
+
+/** files API は 100 件/ページ。巨大 PR での暴走を避けるための取得上限 */
+const FILES_PER_PAGE = 100;
+const MAX_FILE_PAGES = 10;
+
+/** contents API はこのサイズを超えると content を返さない */
+const CONTENTS_SIZE_LIMIT = 1024 * 1024;
+
+interface FetchOk {
+  ok: true;
+  authMode: AuthMode;
+  res: Response;
+}
+
+interface FetchErr {
+  ok: false;
+  authMode: AuthMode;
+  error: GithubApiError;
+}
+
+async function apiGet(pathAndQuery: string): Promise<FetchOk | FetchErr> {
+  const pat = await getPat();
+  const authMode: AuthMode = pat ? 'pat' : 'anonymous';
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (pat) headers['Authorization'] = `Bearer ${pat}`;
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${pathAndQuery}`, { headers });
+  } catch (e) {
+    return {
+      ok: false,
+      authMode,
+      error: { kind: 'network', message: e instanceof Error ? e.message : String(e) },
+    };
+  }
+  if (res.ok) return { ok: true, authMode, res };
+  return { ok: false, authMode, error: await toApiError(res) };
+}
+
+async function toApiError(res: Response): Promise<GithubApiError> {
+  const status = res.status;
+  let message = res.statusText;
+  try {
+    const body: unknown = await res.json();
+    if (body && typeof body === 'object' && 'message' in body) {
+      message = String((body as { message: unknown }).message);
+    }
+  } catch {
+    // body が JSON でなくても statusText で続行
+  }
+  if (status === 401) return { kind: 'unauthorized', status, message };
+  if (status === 403 || status === 429) {
+    const remaining = res.headers.get('x-ratelimit-remaining');
+    if (remaining === '0' || /rate limit/i.test(message)) {
+      const reset = res.headers.get('x-ratelimit-reset');
+      return {
+        kind: 'rate_limited',
+        status,
+        message,
+        rateLimitReset: reset ? Number(reset) * 1000 : undefined,
+      };
+    }
+    return { kind: 'forbidden', status, message };
+  }
+  if (status === 404) return { kind: 'not_found', status, message };
+  return { kind: 'unexpected', status, message };
+}
+
+/** GET /repos/{owner}/{repo}/pulls/{n} — head SHA などのメタ情報 */
+export async function getPrInfo(pr: PrRef): Promise<GithubResult<PrInfo>> {
+  const r = await apiGet(`/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
+  if (!r.ok) return r;
+  const json = (await r.res.json()) as {
+    title: string;
+    state: string;
+    head: { sha: string; repo: { name: string; owner: { login: string } } | null };
+    base: { sha: string };
+  };
+  return {
+    ok: true,
+    authMode: r.authMode,
+    value: {
+      title: json.title,
+      state: json.state,
+      headSha: json.head.sha,
+      baseSha: json.base.sha,
+      // head.repo は fork が削除済みだと null。その場合は base 側リポジトリで引く
+      headRepo: json.head.repo
+        ? { owner: json.head.repo.owner.login, repo: json.head.repo.name }
+        : { owner: pr.owner, repo: pr.repo },
+    },
+  };
+}
+
+/** GET /repos/{owner}/{repo}/pulls/{n}/files — 変更ファイル一覧（pagination 対応） */
+export async function getPrFiles(pr: PrRef): Promise<GithubResult<PrFilesPayload>> {
+  const files: PrFile[] = [];
+  let authMode: AuthMode = 'anonymous';
+  let truncated = false;
+
+  for (let page = 1; page <= MAX_FILE_PAGES; page++) {
+    const r = await apiGet(
+      `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/files?per_page=${FILES_PER_PAGE}&page=${page}`
+    );
+    if (!r.ok) return r;
+    authMode = r.authMode;
+    const json = (await r.res.json()) as Array<{
+      filename: string;
+      previous_filename?: string;
+      status: string;
+      additions: number;
+      deletions: number;
+    }>;
+    for (const f of json) {
+      files.push({
+        path: f.filename,
+        previousPath: f.previous_filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
+      });
+    }
+    const hasNext = /(?:^|,)\s*<[^>]+>;\s*rel="next"/.test(r.res.headers.get('link') ?? '');
+    if (json.length < FILES_PER_PAGE || !hasNext) {
+      return { ok: true, authMode, value: { files, truncated: false } };
+    }
+    truncated = page === MAX_FILE_PAGES;
+  }
+  return { ok: true, authMode, value: { files, truncated } };
+}
+
+/** contents API の base64（改行入り）を UTF-8 テキストにデコードする */
+function decodeBase64Utf8(b64: string): string {
+  const bin = atob(b64.replace(/\s/g, ''));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+/** GET /repos/{owner}/{repo}/contents/{path}?ref={sha} — ファイル内容 */
+export async function getFileContent(
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string
+): Promise<GithubResult<FileContentPayload>> {
+  const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+  const r = await apiGet(
+    `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`
+  );
+  if (!r.ok) return r;
+  const json = (await r.res.json()) as
+    | { type: string; size: number; encoding?: string; content?: string }
+    | unknown[];
+
+  if (Array.isArray(json) || json.type !== 'file') {
+    return {
+      ok: false,
+      authMode: r.authMode,
+      error: { kind: 'unexpected', message: `ファイルではありません: ${path}` },
+    };
+  }
+  if (json.encoding !== 'base64' || typeof json.content !== 'string' || json.size > CONTENTS_SIZE_LIMIT) {
+    // 1MB 超は encoding: "none" で content が空になる
+    return {
+      ok: false,
+      authMode: r.authMode,
+      error: { kind: 'too_large', message: `size=${json.size}: ${path}` },
+    };
+  }
+  return {
+    ok: true,
+    authMode: r.authMode,
+    value: { path, ref, size: json.size, content: decodeBase64Utf8(json.content) },
+  };
+}
+
+/** PAT があれば GET /user で有効性確認、なければ GET /rate_limit で疎通確認 */
+export async function testAuth(): Promise<GithubResult<AuthTestPayload>> {
+  const pat = await getPat();
+  if (pat) {
+    const r = await apiGet('/user');
+    if (!r.ok) return r;
+    const json = (await r.res.json()) as { login: string };
+    return {
+      ok: true,
+      authMode: r.authMode,
+      value: {
+        authenticated: true,
+        login: json.login,
+        rateLimit: rateLimitFromHeaders(r.res.headers),
+      },
+    };
+  }
+  const r = await apiGet('/rate_limit');
+  if (!r.ok) return r;
+  const json = (await r.res.json()) as {
+    resources: { core: { limit: number; remaining: number; reset: number } };
+  };
+  return {
+    ok: true,
+    authMode: r.authMode,
+    value: { authenticated: false, rateLimit: json.resources.core },
+  };
+}
+
+function rateLimitFromHeaders(
+  headers: Headers
+): AuthTestPayload['rateLimit'] {
+  const limit = headers.get('x-ratelimit-limit');
+  const remaining = headers.get('x-ratelimit-remaining');
+  const reset = headers.get('x-ratelimit-reset');
+  if (limit == null || remaining == null || reset == null) return undefined;
+  return { limit: Number(limit), remaining: Number(remaining), reset: Number(reset) };
+}
