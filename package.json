@@ -1,0 +1,22 @@
+{
+  "name": "functions-tree",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub PR ページ上で関数の依存関係グラフを表示する Chrome 拡張 (MV3)",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "bundle:content": "esbuild src/content/index.ts --bundle --format=iife --outfile=dist/content.js",
+    "bundle:sw": "esbuild src/background/sw.ts --bundle --format=esm --external:module --external:fs --external:path --outfile=dist/sw.js",
+    "copy-static": "cp manifest.json dist/",
+    "build": "npm run clean && npm run typecheck && npm run bundle:content && npm run bundle:sw && mkdir -p dist && npm run copy-static",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "esbuild": "^0.28.1",
+    "playwright": "^1.58.2",
+    "typescript": "^5.5.0"
+  }
+}

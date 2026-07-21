@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Functions Tree",
+  "version": "0.1.0",
+  "description": "GitHub PR ページ上で関数の依存関係グラフを表示する",
+  "background": { "service_worker": "sw.js", "type": "module" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://github.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
