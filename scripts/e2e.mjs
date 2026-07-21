@@ -4,11 +4,18 @@
 // branded Chrome 137+ は --load-extension を無視するため channel: 'chromium' が必須。
 //
 // Phase 2 で追加した確認項目:
-// - パネルを開くと変更ファイル一覧が表示される（未認証モード表示込み）
 // - options ページで PAT の保存・削除が chrome.storage.local に反映される
 // - エラー経路: 存在しない PR 番号 → not_found / 無効 PAT の接続テスト → 401 表示
 //
-// usage: node scripts/e2e.mjs [--repo owner/name] [--out screenshot-dir]
+// Phase 3 で追加した確認項目:
+// - パネルを開くとコールグラフのサマリ（関数/呼び出し/解析/スキップ数）と
+//   関数一覧（inDiff バッジ付き）が表示される
+// - パネルを閉じて開き直すと SW メモリキャッシュから返る（「（キャッシュ）」表示）
+//
+// レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
+// 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
+//
+// usage: node scripts/e2e.mjs [--repo owner/name] [--pr number] [--out screenshot-dir]
 
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -22,6 +29,7 @@ const argOf = (name, fallback) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 };
 const repo = argOf('--repo', 'microsoft/TypeScript');
+const prNumber = argOf('--pr', null);
 const outDir = argOf('--out', 'e2e-results');
 const distPath = fileURLToPath(new URL('../dist', import.meta.url));
 
@@ -66,42 +74,61 @@ try {
   record('repo top: no button injected', buttonOnTop === 0, `count=${buttonOnTop}`);
   await shot(page, '1-repo-top-no-button');
 
-  // 2. PR 一覧からオープン PR を 1 つ選び、SPA 遷移で PR ページへ
-  await page.goto(`https://github.com/${repo}/pulls`, { waitUntil: 'domcontentloaded' });
-  const prLink = page.locator(`a[href*="/${repo}/pull/"]`).first();
-  await prLink.waitFor({ timeout: 30_000 });
-  const prHref = await prLink.getAttribute('href');
-  console.log(`  navigating to PR: ${prHref}`);
-  await prLink.click();
-  await page.waitForURL(/\/pull\/\d+/, { timeout: 30_000 });
+  // 2. PR ページへ（--pr 指定があれば直接、なければ PR 一覧の先頭を SPA 遷移で開く）
+  let prHref;
+  if (prNumber) {
+    prHref = `/${repo}/pull/${prNumber}`;
+    console.log(`  navigating to PR: ${prHref}`);
+    await page.goto(`https://github.com${prHref}`, { waitUntil: 'domcontentloaded' });
+  } else {
+    await page.goto(`https://github.com/${repo}/pulls`, { waitUntil: 'domcontentloaded' });
+    const prLink = page.locator(`a[href*="/${repo}/pull/"]`).first();
+    await prLink.waitFor({ timeout: 30_000 });
+    prHref = await prLink.getAttribute('href');
+    console.log(`  navigating to PR: ${prHref}`);
+    await prLink.click();
+    await page.waitForURL(/\/pull\/\d+/, { timeout: 30_000 });
+  }
 
   // 3. PR ページ: ボタンが注入されること
   await page.locator(BUTTON).waitFor({ timeout: 15_000 });
   record('PR page: button injected', true, prHref);
   await shot(page, '2-pr-page-button');
 
-  // 4. ボタン押下でパネルが開き、変更ファイル一覧が表示されること（未認証モード）
+  // 4. ボタン押下でパネルが開き、コールグラフのサマリと関数一覧が表示されること
+  const waitForGraphStatus = () =>
+    page.waitForFunction(
+      () => {
+        const t = document.querySelector('#functions-tree-panel-host')
+          ?.shadowRoot?.querySelector('.status')?.textContent ?? '';
+        return t !== '' && !t.includes('解析中');
+      },
+      undefined,
+      { timeout: 90_000 } // 解析は contents API の取得回数に依存する
+    );
+  const readPanel = () =>
+    page.evaluate(() => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      return {
+        status: (shadow?.querySelector('.status')?.textContent ?? '').trim(),
+        functionCount: shadow?.querySelectorAll('.function-item').length ?? 0,
+        inDiffCount: shadow?.querySelectorAll('.in-diff-badge').length ?? 0,
+      };
+    });
+
   await page.locator(BUTTON).click();
-  const status = page.locator(PANEL_STATUS);
-  await status.waitFor({ timeout: 10_000 });
-  await page.waitForFunction(
-    () => {
-      const t = document.querySelector('#functions-tree-panel-host')
-        ?.shadowRoot?.querySelector('.status')?.textContent ?? '';
-      return t !== '' && !t.includes('取得中');
-    },
-    undefined,
-    { timeout: 30_000 }
-  );
-  const statusText = ((await status.textContent()) ?? '').trim();
-  const fileCount = await page.evaluate(() =>
-    document.querySelector('#functions-tree-panel-host')
-      ?.shadowRoot?.querySelectorAll('.file-item').length ?? 0
+  await page.locator(PANEL_STATUS).waitFor({ timeout: 10_000 });
+  await waitForGraphStatus();
+  const panel1 = await readPanel();
+  record(
+    'panel: graph summary rendered (nodes/edges/files/skips)',
+    /関数 \d+ \/ 呼び出し \d+ \/ 解析 \d+ ファイル \/ スキップ \d+/.test(panel1.status),
+    `status="${panel1.status}"`
   );
   record(
-    'panel: PR file list rendered',
-    statusText.includes('変更ファイル') && fileCount > 0,
-    `status="${statusText}" items=${fileCount}`
+    'panel: function list with inDiff badges',
+    panel1.functionCount > 0 && panel1.inDiffCount > 0,
+    `functions=${panel1.functionCount} inDiff=${panel1.inDiffCount}`
   );
   const authNoticeVisible = await page.evaluate(() => {
     const el = document.querySelector('#functions-tree-panel-host')
@@ -110,29 +137,41 @@ try {
       (el.textContent ?? '').includes('未認証モード');
   });
   record('panel: anonymous-mode notice shown', authNoticeVisible);
-  await shot(page, '3-panel-file-list-anonymous');
+  await shot(page, '3-panel-graph-functions');
 
-  // 5. 再度押下でパネルが閉じること
+  // 5. 閉じて開き直すと SW メモリキャッシュから返ること（レート制限を消費しない）
+  await page.locator(BUTTON).click(); // close
+  await page.locator(BUTTON).click(); // reopen
+  await waitForGraphStatus();
+  const panel2 = await readPanel();
+  record(
+    'panel: second open served from SW cache',
+    panel2.status.includes('（キャッシュ）') && panel2.functionCount === panel1.functionCount,
+    `status="${panel2.status}"`
+  );
+  await shot(page, '4-panel-graph-cached');
+
+  // 6. 再度押下でパネルが閉じること
   await page.locator(BUTTON).click();
   const panelCount = await page.locator('#functions-tree-panel-host').count();
   record('panel: toggle closes panel', panelCount === 0, `count=${panelCount}`);
 
-  // 6. SPA 遷移で PR ページを離れるとボタンが消えること（戻る = popstate）
+  // 7. SPA 遷移で PR ページを離れるとボタンが消えること（戻る = popstate）
   await page.goBack({ waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(3000);
   const buttonAfterLeave = await page.locator(BUTTON).count();
   record('SPA leave: button removed', buttonAfterLeave === 0, `count=${buttonAfterLeave}`);
-  await shot(page, '4-spa-leave-no-button');
+  await shot(page, '5-spa-leave-no-button');
 
-  // 7. SPA 遷移で PR ページに戻るとボタンが再注入されること
+  // 8. SPA 遷移で PR ページに戻るとボタンが再注入されること
   await page.goForward({ waitUntil: 'domcontentloaded' });
   await page.locator(BUTTON).waitFor({ timeout: 15_000 });
   record('SPA re-enter: button re-injected', true);
-  await shot(page, '5-spa-reenter-button');
+  await shot(page, '6-spa-reenter-button');
 
   // === Phase 2: options ページと GitHub API のエラー経路 ===
 
-  // 8. options ページを開く（拡張 ID は service worker の URL から取る）
+  // 9. options ページを開く（拡張 ID は service worker の URL から取る）
   const worker =
     context.serviceWorkers()[0] ??
     (await context.waitForEvent('serviceworker', { timeout: 15_000 }));
@@ -149,7 +188,7 @@ try {
   const initialStatus = ((await optionsPage.locator('#pat-status').textContent()) ?? '').trim();
   record('options: opens with PAT unset', initialStatus.includes('未設定'), initialStatus);
 
-  // 9. エラー経路その1: 存在しない PR 番号 → not_found（未認証のうちに確認）
+  // 10. エラー経路その1: 存在しない PR 番号 → not_found（未認証のうちに確認）
   const notFound = await optionsPage.evaluate(
     ([owner, name]) =>
       chrome.runtime.sendMessage({
@@ -164,7 +203,7 @@ try {
     JSON.stringify(notFound?.error ?? notFound)
   );
 
-  // 10. ダミー PAT の保存が chrome.storage.local に反映されること
+  // 11. ダミー PAT の保存が chrome.storage.local に反映されること
   await optionsPage.fill('#pat-input', DUMMY_PAT);
   await optionsPage.click('#save');
   await optionsPage.waitForFunction(
@@ -179,9 +218,9 @@ try {
     stored.githubPat === DUMMY_PAT && !savedStatus.includes(DUMMY_PAT),
     savedStatus
   );
-  await shot(optionsPage, '6-options-pat-saved');
+  await shot(optionsPage, '7-options-pat-saved');
 
-  // 11. エラー経路その2: 無効 PAT で接続テスト → 401 が人間に読める形で出ること
+  // 12. エラー経路その2: 無効 PAT で接続テスト → 401 が人間に読める形で出ること
   await optionsPage.click('#test');
   await optionsPage.waitForFunction(
     () => {
@@ -197,9 +236,9 @@ try {
     testText.includes('PAT が無効'),
     testText
   );
-  await shot(optionsPage, '7-options-test-invalid-pat');
+  await shot(optionsPage, '8-options-test-invalid-pat');
 
-  // 12. PAT 削除が chrome.storage.local に反映されること
+  // 13. PAT 削除が chrome.storage.local に反映されること
   await optionsPage.click('#delete');
   await optionsPage.waitForFunction(
     () => (document.querySelector('#pat-status')?.textContent ?? '').includes('未設定'),
@@ -208,7 +247,7 @@ try {
   );
   const cleared = await optionsPage.evaluate(() => chrome.storage.local.get('githubPat'));
   record('options: PAT deleted from chrome.storage.local', cleared.githubPat === undefined);
-  await shot(optionsPage, '8-options-pat-deleted');
+  await shot(optionsPage, '9-options-pat-deleted');
 } catch (e) {
   record('e2e run', false, e.message);
 } finally {
