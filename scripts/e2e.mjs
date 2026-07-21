@@ -8,9 +8,13 @@
 // - エラー経路: 存在しない PR 番号 → not_found / 無効 PAT の接続テスト → 401 表示
 //
 // Phase 3 で追加した確認項目:
-// - パネルを開くとコールグラフのサマリ（関数/呼び出し/解析/スキップ数）と
-//   関数一覧（inDiff バッジ付き）が表示される
+// - パネルを開くとコールグラフのサマリ（関数/呼び出し/解析/スキップ数）が表示される
 // - パネルを閉じて開き直すと SW メモリキャッシュから返る（「（キャッシュ）」表示）
+//
+// Phase 4 で追加した確認項目:
+// - パネルに mermaid の SVG グラフが描画される（inDiff / 依存先の色分けクラス + 凡例）
+// - ノードクリックでサイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）が出る
+// - フィルタトグル（エッジのあるノードのみ）で表示ノード数が切り替わる
 //
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
@@ -95,7 +99,7 @@ try {
   record('PR page: button injected', true, prHref);
   await shot(page, '2-pr-page-button');
 
-  // 4. ボタン押下でパネルが開き、コールグラフのサマリと関数一覧が表示されること
+  // 4. ボタン押下でパネルが開き、コールグラフのサマリと mermaid の SVG が描画されること
   const waitForGraphStatus = () =>
     page.waitForFunction(
       () => {
@@ -106,19 +110,35 @@ try {
       undefined,
       { timeout: 90_000 } // 解析は contents API の取得回数に依存する
     );
+  // 解析完了後も mermaid の動的 import + 描画が非同期に走るため、SVG（または空表示）を待つ
+  const waitForGraphRender = () =>
+    page.waitForFunction(
+      () => {
+        const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+        return !!shadow?.querySelector('.graph-area svg, .graph-empty') ||
+          !!shadow?.querySelector('.status[data-state="error"]');
+      },
+      undefined,
+      { timeout: 60_000 }
+    );
   const readPanel = () =>
     page.evaluate(() => {
       const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
       return {
         status: (shadow?.querySelector('.status')?.textContent ?? '').trim(),
-        functionCount: shadow?.querySelectorAll('.function-item').length ?? 0,
-        inDiffCount: shadow?.querySelectorAll('.in-diff-badge').length ?? 0,
+        svgCount: shadow?.querySelectorAll('.graph-area svg').length ?? 0,
+        nodeCount: shadow?.querySelectorAll('.graph-area g.node').length ?? 0,
+        inDiffNodeCount: shadow?.querySelectorAll('.graph-area g.node.inDiff').length ?? 0,
+        depNodeCount: shadow?.querySelectorAll('.graph-area g.node.dep').length ?? 0,
+        legendCount: shadow?.querySelectorAll('.legend-item').length ?? 0,
+        countText: (shadow?.querySelector('.node-count')?.textContent ?? '').trim(),
       };
     });
 
   await page.locator(BUTTON).click();
   await page.locator(PANEL_STATUS).waitFor({ timeout: 10_000 });
   await waitForGraphStatus();
+  await waitForGraphRender();
   const panel1 = await readPanel();
   record(
     'panel: graph summary rendered (nodes/edges/files/skips)',
@@ -126,9 +146,15 @@ try {
     `status="${panel1.status}"`
   );
   record(
-    'panel: function list with inDiff badges',
-    panel1.functionCount > 0 && panel1.inDiffCount > 0,
-    `functions=${panel1.functionCount} inDiff=${panel1.inDiffCount}`
+    'panel: mermaid SVG graph rendered',
+    panel1.svgCount === 1 && panel1.nodeCount > 0,
+    `svg=${panel1.svgCount} nodes=${panel1.nodeCount} (${panel1.countText})`
+  );
+  record(
+    'panel: inDiff/dep color classes + legend',
+    panel1.inDiffNodeCount + panel1.depNodeCount === panel1.nodeCount &&
+      panel1.inDiffNodeCount > 0 && panel1.legendCount === 2,
+    `inDiff=${panel1.inDiffNodeCount} dep=${panel1.depNodeCount} legend=${panel1.legendCount}`
   );
   const authNoticeVisible = await page.evaluate(() => {
     const el = document.querySelector('#functions-tree-panel-host')
@@ -137,37 +163,76 @@ try {
       (el.textContent ?? '').includes('未認証モード');
   });
   record('panel: anonymous-mode notice shown', authNoticeVisible);
-  await shot(page, '3-panel-graph-functions');
+  await shot(page, '3-panel-mermaid-graph');
 
-  // 5. 閉じて開き直すと SW メモリキャッシュから返ること（レート制限を消費しない）
+  // 5. ノードクリックでサイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）が出ること
+  await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
+  const detail = await page.evaluate(() => {
+    const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+    return {
+      name: (shadow?.querySelector('.detail-name')?.textContent ?? '').trim(),
+      meta: (shadow?.querySelector('.detail-meta')?.textContent ?? '').trim(),
+      sourceLength: (shadow?.querySelector('.source code')?.textContent ?? '').length,
+      hasCommentUi: !!shadow?.querySelector('.comment-input, .comment-disabled'),
+      selectedCount: shadow?.querySelectorAll('.graph-area g.node.selected').length ?? 0,
+    };
+  });
+  record(
+    'node click: side pane shows function detail with source',
+    detail.name !== '' && /:\d+-\d+$/.test(detail.meta) &&
+      detail.sourceLength > 0 && detail.hasCommentUi && detail.selectedCount === 1,
+    `name=${detail.name} meta=${detail.meta} sourceLen=${detail.sourceLength} selected=${detail.selectedCount}`
+  );
+  await shot(page, '4-node-detail-source');
+
+  // 6. フィルタトグル OFF（エッジのあるノードのみ → 全ノード）で表示が増えること
+  await page.locator('#functions-tree-panel-host .filter-connected').click();
+  await page.waitForFunction(
+    (prev) => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      return (shadow?.querySelectorAll('.graph-area g.node').length ?? 0) > prev;
+    },
+    panel1.nodeCount,
+    { timeout: 30_000 }
+  );
+  const panelAll = await readPanel();
+  record(
+    'filter toggle: showing all nodes increases rendered count',
+    panelAll.nodeCount > panel1.nodeCount,
+    `connectedOnly=${panel1.nodeCount} -> all=${panelAll.nodeCount} (${panelAll.countText})`
+  );
+  await shot(page, '5-filter-all-nodes');
+
+  // 7. 閉じて開き直すと SW メモリキャッシュから返ること（レート制限を消費しない）
   await page.locator(BUTTON).click(); // close
-  await page.locator(BUTTON).click(); // reopen
+  await page.locator(BUTTON).click(); // reopen（フィルタはデフォルトに戻る）
   await waitForGraphStatus();
+  await waitForGraphRender();
   const panel2 = await readPanel();
   record(
     'panel: second open served from SW cache',
-    panel2.status.includes('（キャッシュ）') && panel2.functionCount === panel1.functionCount,
-    `status="${panel2.status}"`
+    panel2.status.includes('（キャッシュ）') && panel2.nodeCount === panel1.nodeCount,
+    `status="${panel2.status}" nodes=${panel2.nodeCount}`
   );
-  await shot(page, '4-panel-graph-cached');
+  await shot(page, '6-panel-graph-cached');
 
-  // 6. 再度押下でパネルが閉じること
+  // 8. 再度押下でパネルが閉じること
   await page.locator(BUTTON).click();
   const panelCount = await page.locator('#functions-tree-panel-host').count();
   record('panel: toggle closes panel', panelCount === 0, `count=${panelCount}`);
 
-  // 7. SPA 遷移で PR ページを離れるとボタンが消えること（戻る = popstate）
+  // 9. SPA 遷移で PR ページを離れるとボタンが消えること（戻る = popstate）
   await page.goBack({ waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(3000);
   const buttonAfterLeave = await page.locator(BUTTON).count();
   record('SPA leave: button removed', buttonAfterLeave === 0, `count=${buttonAfterLeave}`);
-  await shot(page, '5-spa-leave-no-button');
+  await shot(page, '7-spa-leave-no-button');
 
-  // 8. SPA 遷移で PR ページに戻るとボタンが再注入されること
+  // 10. SPA 遷移で PR ページに戻るとボタンが再注入されること
   await page.goForward({ waitUntil: 'domcontentloaded' });
   await page.locator(BUTTON).waitFor({ timeout: 15_000 });
   record('SPA re-enter: button re-injected', true);
-  await shot(page, '6-spa-reenter-button');
+  await shot(page, '8-spa-reenter-button');
 
   // === Phase 2: options ページと GitHub API のエラー経路 ===
 
@@ -218,7 +283,7 @@ try {
     stored.githubPat === DUMMY_PAT && !savedStatus.includes(DUMMY_PAT),
     savedStatus
   );
-  await shot(optionsPage, '7-options-pat-saved');
+  await shot(optionsPage, '9-options-pat-saved');
 
   // 12. エラー経路その2: 無効 PAT で接続テスト → 401 が人間に読める形で出ること
   await optionsPage.click('#test');
@@ -236,7 +301,7 @@ try {
     testText.includes('PAT が無効'),
     testText
   );
-  await shot(optionsPage, '8-options-test-invalid-pat');
+  await shot(optionsPage, '10-options-test-invalid-pat');
 
   // 13. PAT 削除が chrome.storage.local に反映されること
   await optionsPage.click('#delete');
@@ -247,7 +312,7 @@ try {
   );
   const cleared = await optionsPage.evaluate(() => chrome.storage.local.get('githubPat'));
   record('options: PAT deleted from chrome.storage.local', cleared.githubPat === undefined);
-  await shot(optionsPage, '9-options-pat-deleted');
+  await shot(optionsPage, '11-options-pat-deleted');
 } catch (e) {
   record('e2e run', false, e.message);
 } finally {

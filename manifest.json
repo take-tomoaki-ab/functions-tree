@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Functions Tree",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "GitHub PR ページ上で関数の依存関係グラフを表示する",
   "background": { "service_worker": "sw.js", "type": "module" },
   "permissions": ["storage"],
@@ -15,6 +15,12 @@
       "matches": ["https://github.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["mermaid-view.js"],
+      "matches": ["https://github.com/*"]
     }
   ]
 }
