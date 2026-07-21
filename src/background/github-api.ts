@@ -228,6 +228,45 @@ export async function getFileContent(
 }
 
 /**
+ * GET /repos/{owner}/{repo}/contents/{dir}?ref={sha} — ディレクトリ直下のファイル一覧。
+ * Go のパッケージ解決（ディレクトリ = パッケージ）に使う。dir は '' でリポジトリルート。
+ */
+export async function listDirectory(
+  owner: string,
+  repo: string,
+  dir: string,
+  ref: string
+): Promise<GithubResult<string[]>> {
+  const encodedPath = dir
+    .split('/')
+    .filter((s) => s !== '')
+    .map(encodeURIComponent)
+    .join('/');
+  const r = await apiGet(
+    `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`
+  );
+  if (!r.ok) return r;
+  const json = (await r.res.json()) as unknown;
+  if (!Array.isArray(json)) {
+    return {
+      ok: false,
+      authMode: r.authMode,
+      error: { kind: 'unexpected', message: `ディレクトリではありません: ${dir}` },
+    };
+  }
+  const paths = json
+    .filter(
+      (e): e is { type: string; path: string } =>
+        !!e &&
+        typeof e === 'object' &&
+        (e as { type?: unknown }).type === 'file' &&
+        typeof (e as { path?: unknown }).path === 'string'
+    )
+    .map((e) => e.path);
+  return { ok: true, authMode: r.authMode, value: paths };
+}
+
+/**
  * POST /repos/{owner}/{repo}/pulls/{n}/comments — レビューコメント投稿。
  * line は diff（patch）の RIGHT サイドに含まれる行であること。
  * PAT 未設定なら API を呼ばずに kind: 'pat_required' を返す

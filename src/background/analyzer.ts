@@ -4,9 +4,9 @@
 import type { GithubResult } from '../shared/github';
 import type { GraphPayload } from '../shared/graph';
 import type { PrRef } from '../shared/messages';
-import type { Analyzer, FetchFileResult } from './analyzer-core';
+import type { Analyzer, FetchFileResult, ListDirResult } from './analyzer-core';
 import { buildGraph, createAnalyzer, isAnalyzablePath } from './analyzer-core';
-import { getFileContent, getPrFiles, getPrInfo } from './github-api';
+import { getFileContent, getPrFiles, getPrInfo, listDirectory } from './github-api';
 
 // Parser / Language の初期化は 10ms 程度だが、SW の生存中は使い回す。
 // SW が休止 → 再起動するとモジュールスコープごと消えるので、遅延初期化で包む。
@@ -15,8 +15,12 @@ let analyzerPromise: Promise<Analyzer> | null = null;
 function getAnalyzer(): Promise<Analyzer> {
   analyzerPromise ??= createAnalyzer({
     runtimeWasm: chrome.runtime.getURL('wasm/web-tree-sitter.wasm'),
-    typescriptWasm: chrome.runtime.getURL('wasm/tree-sitter-typescript.wasm'),
-    tsxWasm: chrome.runtime.getURL('wasm/tree-sitter-tsx.wasm'),
+    grammars: {
+      typescript: chrome.runtime.getURL('wasm/tree-sitter-typescript.wasm'),
+      tsx: chrome.runtime.getURL('wasm/tree-sitter-tsx.wasm'),
+      go: chrome.runtime.getURL('wasm/tree-sitter-go.wasm'),
+      python: chrome.runtime.getURL('wasm/tree-sitter-python.wasm'),
+    },
   }).catch((e) => {
     analyzerPromise = null; // 初期化失敗は次回リトライできるように捨てる
     throw e;
@@ -75,7 +79,15 @@ export async function buildGraphForPr(pr: PrRef): Promise<GithubResult<GraphPayl
     return { ok: false, reason: r.error.kind };
   };
 
-  const graph = await buildGraph(analyzer, changedFiles, fetchFile);
+  // Go のパッケージ解決用（ディレクトリ = パッケージ）。contents API はディレクトリも引ける
+  const listDir = async (dir: string): Promise<ListDirResult> => {
+    const r = await listDirectory(headRepo.owner, headRepo.repo, dir, headSha);
+    if (r.ok) return { ok: true, paths: r.value };
+    if (r.error.kind === 'rate_limited') rateLimitError = r;
+    return { ok: false, reason: r.error.kind };
+  };
+
+  const graph = await buildGraph(analyzer, changedFiles, fetchFile, { listDir });
   if (rateLimitError && graph.analyzedFiles.length === 0) {
     return rateLimitError;
   }

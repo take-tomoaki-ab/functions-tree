@@ -24,9 +24,12 @@ let analyzer;
 
 before(async () => {
   analyzer = await createAnalyzer({
-    // Node では runtimeWasm 省略で web-tree-sitter 同梱の wasm が解決される
-    typescriptWasm: join(grammarDir, 'tree-sitter-typescript.wasm'),
-    tsxWasm: join(grammarDir, 'tree-sitter-tsx.wasm'),
+    // Node では runtimeWasm 省略で web-tree-sitter 同梱の wasm が解決される。
+    // TS のテストなので typescript / tsx の文法だけ渡す（他言語は解析不可でよい）
+    grammars: {
+      typescript: join(grammarDir, 'tree-sitter-typescript.wasm'),
+      tsx: join(grammarDir, 'tree-sitter-tsx.wasm'),
+    },
   });
 });
 

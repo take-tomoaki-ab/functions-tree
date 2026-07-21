@@ -2,6 +2,7 @@
 // PAT そのものは表示せず、保存済みかどうかだけを示す。
 
 import { describeGithubError } from '../shared/github';
+import { LANGUAGE_METADATA } from '../shared/languages';
 import { sendToBackground } from '../shared/messages';
 import { clearPat, getPat, setPat } from '../shared/settings';
 
@@ -70,8 +71,24 @@ async function onTest(): Promise<void> {
   }
 }
 
+/** 対応言語の一覧（shared/languages.ts の登録内容をそのまま表示する） */
+function renderLanguages(): void {
+  const list = el<HTMLUListElement>('languages');
+  for (const lang of LANGUAGE_METADATA) {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.textContent = lang.displayName;
+    const ext = document.createElement('span');
+    ext.className = 'ext';
+    ext.textContent = lang.extensions.join(' ');
+    li.append(name, ext);
+    list.appendChild(li);
+  }
+}
+
 el<HTMLButtonElement>('save').addEventListener('click', () => void onSave());
 el<HTMLButtonElement>('delete').addEventListener('click', () => void onDelete());
 el<HTMLButtonElement>('test').addEventListener('click', () => void onTest());
 
+renderLanguages();
 void refreshStatus();

@@ -67,6 +67,14 @@
     .result[data-state="ok"] { color: var(--ok); }
     .result[data-state="error"] { color: var(--error); }
     .result[data-state="loading"] { color: var(--fg-muted); }
+    .languages { margin: 8px 0 0; padding-left: 20px; font-size: 13px; }
+    .languages li { margin: 4px 0; }
+    .languages .ext {
+      color: var(--fg-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      margin-left: 6px;
+    }
   </style>
 </head>
 <body>
@@ -89,6 +97,13 @@
       <button id="test" type="button">接続テスト</button>
     </div>
     <p id="test-result" class="result"></p>
+
+    <h2>対応言語</h2>
+    <p class="hint">
+      以下の言語のファイルを解析してコールグラフを作ります（拡張子で判定）。
+      それ以外のファイルは解析対象外です。
+    </p>
+    <ul id="languages" class="languages"></ul>
   </main>
   <script src="options.js"></script>
 </body>
