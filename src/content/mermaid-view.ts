@@ -25,6 +25,8 @@ export interface RenderHandle {
   edgeCount: number;
   /** 指定ノードを選択強調する（null で解除）。CSS は .selected クラスで当てる */
   setSelected(nodeId: string | null): void;
+  /** 下書きのあるノードにマークを付ける。CSS は .has-draft クラスで当てる */
+  setDraftMarks(nodeIds: ReadonlySet<string>): void;
 }
 
 /** グラフ描画エンジンの抽象。mermaid 以外（Cytoscape.js 等）への差し替え口 */
@@ -152,13 +154,45 @@ class MermaidRenderer implements GraphRenderer {
       el.addEventListener('click', () => callbacks.onNodeClick(node));
     }
 
+    // 選択・下書きの強調は箱（shape）のインラインスタイル（priority: important）で当てる。
+    // classDef の色は mermaid が SVG 内 <style> に `#svgId .クラス名` + !important で
+    // 埋め込むため、Shadow DOM 側の CSS は specificity（ID セレクタ）で勝てない。
+    // クラス（.selected / .has-draft）も付与するのは、状態の検査（E2E）と
+    // 将来レンダラーを差し替えたときの CSS フォールバックのため。
+    let selectedId: string | null = null;
+    let draftIds: ReadonlySet<string> = new Set();
+    const applyHighlights = (): void => {
+      for (const [graphId, el] of elementByGraphId) {
+        const isSelected = graphId === selectedId;
+        const hasDraft = draftIds.has(graphId);
+        el.classList.toggle('selected', isSelected);
+        el.classList.toggle('has-draft', hasDraft);
+        const shape = el.querySelector<SVGGraphicsElement>('rect, polygon, path');
+        if (!shape) continue;
+        if (isSelected || hasDraft) {
+          // 選択（青）が下書きマーク（オレンジ）より優先
+          shape.style.setProperty('stroke', isSelected ? '#0969da' : '#bc4c00', 'important');
+          shape.style.setProperty('stroke-width', '3px', 'important');
+          shape.style.setProperty('stroke-dasharray', 'none', 'important');
+        } else {
+          // classDef 由来の色は <style> ブロック側にあるので、外せば元の見た目に戻る
+          shape.style.removeProperty('stroke');
+          shape.style.removeProperty('stroke-width');
+          shape.style.removeProperty('stroke-dasharray');
+        }
+      }
+    };
+
     return {
       nodeCount: graph.nodes.length,
       edgeCount: graph.edges.length,
       setSelected(nodeId: string | null): void {
-        for (const [graphId, el] of elementByGraphId) {
-          el.classList.toggle('selected', graphId === nodeId);
-        }
+        selectedId = nodeId;
+        applyHighlights();
+      },
+      setDraftMarks(nodeIds: ReadonlySet<string>): void {
+        draftIds = nodeIds;
+        applyHighlights();
       },
     };
   }

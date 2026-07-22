@@ -69,6 +69,23 @@ export interface ReviewCommentPayload {
   id: number;
 }
 
+/** POST /pulls/{n}/reviews に載せるインラインコメント 1 件分（side は常に RIGHT） */
+export interface ReviewCommentInput {
+  /** リポジトリルートからのファイルパス */
+  path: string;
+  /** RIGHT サイドの行番号（1 始まり） */
+  line: number;
+  /** コメント本文（Markdown） */
+  body: string;
+}
+
+/** POST /pulls/{n}/reviews の成功応答（UI 表示に必要な分だけ） */
+export interface ReviewSubmitPayload {
+  /** 作成されたレビューの PR ページ上の URL */
+  htmlUrl: string;
+  id: number;
+}
+
 export interface AuthTestPayload {
   authenticated: boolean;
   /** PAT 認証時のユーザー名 */

@@ -17,12 +17,18 @@
 // - フィルタトグル（エッジのあるノードのみ）で表示ノード数が切り替わる
 //
 // Phase 5 で追加した確認項目:
-// - 色分けが行レベル判定（commentable / inDiff / dep の 3 区分 + 凡例 3 項目）になる
-// - コメント可能ノード: 対象行の表示 + 未認証ではボタン無効 + PAT 導線
-// - コメント不可ノード: 理由の表示（diff 外 / 関数無変更）
+// - 色分けが行レベル判定（commentable / inDiff / dep の 3 区分）になる
+// - コメント可能ノード: 対象行の表示 / コメント不可ノード: 理由の表示（diff 外 / 関数無変更）
 // - PAT 未設定での投稿要求は background が pat_required で拒否（二重防御）
-// - ダミー PAT 保存 → ボタンが自動で活性化し、投稿実行で 401 が人間可読で表示される
-//   （実 PR への投稿はされない。無効 PAT のため GitHub 側で拒否される）
+//
+// feat/batch-review-comments で追加した確認項目:
+// - 「下書きに追加」は即送信されず、下書き一覧に溜まる（2 ノードで 2 件 + 件数バッジ +
+//   グラフ上の has-draft マーク）
+// - 下書きの編集（一覧の「編集」→ プリフィル → 更新）と削除が一覧に反映される
+// - パネルを閉じて開き直しても、ページをリロードしても下書きが残る（chrome.storage.session）
+// - 未認証時は「まとめて送信」無効 + PAT 導線。SUBMIT_REVIEW も pat_required で拒否
+// - ダミー PAT 保存 → 送信ボタンが自動活性化し、まとめて送信で 401 が人間可読で表示され、
+//   下書きが消えない（実 PR への投稿はされない。無効 PAT のため GitHub 側で拒否される）
 //
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
@@ -163,9 +169,9 @@ try {
   // コメント可ノードの存在は全ノード表示（フィルタ OFF 後の 6.5）で確認する
   // （この PR の変更行を含む関数は孤立ノードで、デフォルトフィルタでは非表示のため）
   record(
-    'panel: commentable/inDiff/dep color classes + legend (line-level)',
+    'panel: commentable/inDiff/dep color classes + legend (line-level + draft)',
     panel1.commentableNodeCount + panel1.inDiffNodeCount + panel1.depNodeCount ===
-      panel1.nodeCount && panel1.legendCount === 3,
+      panel1.nodeCount && panel1.legendCount === 4,
     `commentable=${panel1.commentableNodeCount} inDiff=${panel1.inDiffNodeCount} ` +
       `dep=${panel1.depNodeCount} legend=${panel1.legendCount}`
   );
@@ -189,15 +195,57 @@ try {
         selectedCount: shadow?.querySelectorAll('.graph-area g.node.selected').length ?? 0,
         commentTarget: (shadow?.querySelector('.comment-target')?.textContent ?? '').trim(),
         hasCommentInput: !!shadow?.querySelector('.comment-input'),
-        submitDisabled: shadow?.querySelector('.comment-submit')?.disabled ?? null,
-        authNoticeVisible: (() => {
-          const el = shadow?.querySelector('.comment-auth');
-          return !!el && getComputedStyle(el).display !== 'none' &&
-            !!el.querySelector('.open-options');
+        inputValue: shadow?.querySelector('.comment-input')?.value ?? '',
+        addDisabled: shadow?.querySelector('.draft-add')?.disabled ?? null,
+        addLabel: (shadow?.querySelector('.draft-add')?.textContent ?? '').trim(),
+        removeVisible: (() => {
+          const el = shadow?.querySelector('.draft-remove');
+          return !!el && !el.hidden;
         })(),
         disabledReason: (shadow?.querySelector('.comment-disabled')?.textContent ?? '').trim(),
       };
     });
+
+  // 下書き一覧ペイン（件数バッジ / 一覧 / まとめて送信ボタン / グラフ上のマーク）の状態
+  const readDrafts = () =>
+    page.evaluate(() => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      const items = [...(shadow?.querySelectorAll('.draft-item') ?? [])].map((li) => ({
+        name: (li.querySelector('.draft-node-name')?.textContent ?? '').trim(),
+        loc: (li.querySelector('.draft-loc')?.textContent ?? '').trim(),
+        preview: (li.querySelector('.draft-preview')?.textContent ?? '').trim(),
+      }));
+      const submit = shadow?.querySelector('.review-submit');
+      const auth = shadow?.querySelector('.drafts-auth');
+      const status = shadow?.querySelector('.review-status');
+      return {
+        count: (shadow?.querySelector('.drafts-count')?.textContent ?? '').trim(),
+        items,
+        submitDisabled: submit?.disabled ?? null,
+        submitLabel: (submit?.textContent ?? '').trim(),
+        authVisible: !!auth && getComputedStyle(auth).display !== 'none' &&
+          !!auth.querySelector('.open-options'),
+        statusState: status?.dataset.state ?? '',
+        statusText: (status?.textContent ?? '').trim(),
+        draftMarks: shadow?.querySelectorAll('.graph-area g.node.has-draft').length ?? 0,
+        // マークが視覚的にも効いていること（mermaid の classDef に負けていないこと）の確認
+        markStroke: (() => {
+          const shape = shadow?.querySelector(
+            '.graph-area g.node.has-draft rect, .graph-area g.node.has-draft polygon, .graph-area g.node.has-draft path'
+          );
+          return shape ? getComputedStyle(shape).stroke : '';
+        })(),
+      };
+    });
+  const waitForDraftCount = (expected) =>
+    page.waitForFunction(
+      (exp) => {
+        const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+        return (shadow?.querySelector('.drafts-count')?.textContent ?? '').trim() === exp;
+      },
+      String(expected),
+      { timeout: 15_000 }
+    );
 
   await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
   const detail = await readDetail();
@@ -234,14 +282,23 @@ try {
   );
   await shot(page, '5-filter-all-nodes');
 
-  // 6.3. コメント可能ノード: 対象行の表示 + 未認証ではボタン無効 + PAT 導線
+  // 6.3. コメント可能ノード: 対象行の表示 + 「下書きに追加」は本文が空の間だけ無効
+  //      （追加は PAT 不要。PAT が要るのは「まとめて送信」だけ）
   await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
   const cDetail = await readDetail();
   record(
-    'commentable node: target line shown + submit disabled + PAT link (anonymous)',
+    'commentable node: target line shown + add-draft disabled while body empty',
     cDetail.hasCommentInput && cDetail.commentTarget.includes('にコメントされます') &&
-      cDetail.submitDisabled === true && cDetail.authNoticeVisible,
-    `target="${cDetail.commentTarget}" disabled=${cDetail.submitDisabled} authNotice=${cDetail.authNoticeVisible}`
+      cDetail.addDisabled === true && cDetail.addLabel === '下書きに追加' &&
+      !cDetail.removeVisible,
+    `target="${cDetail.commentTarget}" addDisabled=${cDetail.addDisabled} label="${cDetail.addLabel}"`
+  );
+  const emptyDrafts = await readDrafts();
+  record(
+    'drafts pane: starts empty (count 0, submit disabled)',
+    emptyDrafts.count === '0' && emptyDrafts.submitDisabled === true &&
+      emptyDrafts.items.length === 0,
+    `count=${emptyDrafts.count} submitDisabled=${emptyDrafts.submitDisabled}`
   );
   await shot(page, '5b-commentable-node-anonymous');
 
@@ -424,8 +481,27 @@ try {
     JSON.stringify(patRequired?.error ?? patRequired)
   );
 
+  // 14b. SUBMIT_REVIEW も同様に PAT 未設定なら GitHub に到達する前に拒否されること
+  const reviewPatRequired = await optionsPage.evaluate(
+    ([owner, name]) =>
+      chrome.runtime.sendMessage({
+        type: 'SUBMIT_REVIEW',
+        pr: { owner, repo: name, pr: 1 },
+        commitId: 'deadbeef',
+        comments: [
+          { path: 'src/x.ts', line: 1, body: 'e2e: should be rejected before reaching GitHub' },
+        ],
+      }),
+    repo.split('/')
+  );
+  record(
+    'review: submit without PAT -> pat_required (no API call)',
+    reviewPatRequired?.ok === false && reviewPatRequired?.error?.kind === 'pat_required',
+    JSON.stringify(reviewPatRequired?.error ?? reviewPatRequired)
+  );
+
   // 15. PR ページでパネルを開き直し（未認証・SW キャッシュ）、フィルタを外して
-  //     コメント可能ノードを選択。本文を入れてもボタンは無効のまま（PAT 未設定）
+  //     2 つのコメント可能ノードに下書きを追加 → 一覧に 2 件 + 件数バッジ + グラフのマーク
   await page.bringToFront();
   await page.locator(BUTTON).click();
   await waitForGraphStatus();
@@ -436,18 +512,113 @@ try {
     .locator('#functions-tree-panel-host .graph-area g.node.commentable')
     .first()
     .waitFor({ timeout: 30_000 });
-  await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
-  const commentText = 'e2e dummy comment（無効 PAT のため実投稿はされない）';
-  await page.locator('#functions-tree-panel-host .comment-input').fill(commentText);
-  const beforePat = await readDetail();
-  record(
-    'comment: body filled but submit still disabled without PAT',
-    beforePat.submitDisabled === true && beforePat.authNoticeVisible,
-    `disabled=${beforePat.submitDisabled} authNotice=${beforePat.authNoticeVisible}`
-  );
-  await shot(page, '12-comment-disabled-no-pat');
+  const commentable = page.locator('#functions-tree-panel-host .graph-area g.node.commentable');
+  const commentableCount = await commentable.count();
 
-  // 16. 別タブの options でダミー PAT を保存 → storage.onChanged でボタンが自動活性化すること
+  const draft1Text = 'e2e 下書き 1（まとめて送信するまで投稿されない）';
+  await commentable.first().click();
+  await page.locator('#functions-tree-panel-host .comment-input').fill(draft1Text);
+  await page.locator('#functions-tree-panel-host .draft-add').click();
+  const afterFirst = await readDrafts();
+  record(
+    'drafts: add first draft -> queued locally (count 1, not sent)',
+    afterFirst.count === '1' && afterFirst.items.length === 1 &&
+      afterFirst.items[0].name !== '' && /:L\d+$/.test(afterFirst.items[0].loc) &&
+      afterFirst.items[0].preview.includes('e2e 下書き 1'),
+    `count=${afterFirst.count} item=${JSON.stringify(afterFirst.items[0])}`
+  );
+
+  if (commentableCount >= 2) {
+    const draft2Text = 'e2e 下書き 2（複数ノードに溜められる）';
+    await commentable.nth(1).click();
+    await page.locator('#functions-tree-panel-host .comment-input').fill(draft2Text);
+    await page.locator('#functions-tree-panel-host .draft-add').click();
+  }
+  const afterSecond = await readDrafts();
+  record(
+    'drafts: two drafts across nodes (count badge 2 + has-draft marks on graph)',
+    commentableCount >= 2 && afterSecond.count === '2' &&
+      afterSecond.items.length === 2 && afterSecond.draftMarks === 2 &&
+      afterSecond.markStroke === 'rgb(188, 76, 0)', // #bc4c00 が classDef を上書きできている
+    `commentableNodes=${commentableCount} count=${afterSecond.count} ` +
+      `marks=${afterSecond.draftMarks} stroke=${afterSecond.markStroke}`
+  );
+  record(
+    'drafts: submit disabled + PAT link while anonymous',
+    afterSecond.submitDisabled === true && afterSecond.authVisible &&
+      afterSecond.submitLabel.includes('件の下書きをまとめて送信'),
+    `submitDisabled=${afterSecond.submitDisabled} authVisible=${afterSecond.authVisible} label="${afterSecond.submitLabel}"`
+  );
+  await shot(page, '12-drafts-two-items-no-pat');
+
+  // 16. 下書きの編集: 一覧の「編集」→ フォームにプリフィル → 本文を変えて「下書きを更新」
+  await page.locator('#functions-tree-panel-host .draft-item .draft-edit').first().click();
+  const editDetail = await readDetail();
+  record(
+    'drafts: edit button prefills form (body + update/delete buttons)',
+    editDetail.inputValue === draft1Text && editDetail.addLabel === '下書きを更新' &&
+      editDetail.removeVisible,
+    `input="${editDetail.inputValue}" label="${editDetail.addLabel}" remove=${editDetail.removeVisible}`
+  );
+  const editedText = 'e2e 下書き 1（編集済み）';
+  await page.locator('#functions-tree-panel-host .comment-input').fill(editedText);
+  await page.locator('#functions-tree-panel-host .draft-add').click();
+  const afterEdit = await readDrafts();
+  record(
+    'drafts: update reflects in list (count stays 2, preview updated)',
+    afterEdit.count === '2' &&
+      afterEdit.items.some((i) => i.preview.includes('編集済み')),
+    `count=${afterEdit.count} previews=${JSON.stringify(afterEdit.items.map((i) => i.preview))}`
+  );
+  await shot(page, '13-draft-edited');
+
+  // 17. 下書きの削除: 一覧の「削除」→ 1 件に減る → 再追加して 2 件に戻す
+  await page.locator('#functions-tree-panel-host .draft-item .draft-delete').nth(1).click();
+  const afterDelete = await readDrafts();
+  record(
+    'drafts: delete removes one draft (count 2 -> 1)',
+    afterDelete.count === '1' && afterDelete.items.length === 1 &&
+      afterDelete.draftMarks === 1,
+    `count=${afterDelete.count} marks=${afterDelete.draftMarks}`
+  );
+  if (commentableCount >= 2) {
+    await commentable.nth(1).click();
+    await page
+      .locator('#functions-tree-panel-host .comment-input')
+      .fill('e2e 下書き 2（削除後の再追加）');
+    await page.locator('#functions-tree-panel-host .draft-add').click();
+  }
+
+  // 18. パネルを閉じて開き直しても下書きが残ること（chrome.storage.session への退避）
+  await page.locator(BUTTON).click(); // close
+  await page.locator(BUTTON).click(); // reopen
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  await waitForDraftCount(2);
+  const afterReopen = await readDrafts();
+  record(
+    'drafts: survive panel close/reopen (restored from storage.session)',
+    afterReopen.count === '2' && afterReopen.items.length === 2,
+    `count=${afterReopen.count}`
+  );
+  await shot(page, '14-drafts-persist-reopen');
+
+  // 19. ページを丸ごとリロード（content script 再注入）でも下書きが残ること
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.locator(BUTTON).waitFor({ timeout: 15_000 });
+  await page.locator(BUTTON).click();
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  await waitForDraftCount(2);
+  const afterReload = await readDrafts();
+  record(
+    'drafts: survive full page reload (content script re-injected)',
+    afterReload.count === '2' && afterReload.items.length === 2,
+    `count=${afterReload.count}`
+  );
+  await shot(page, '15-drafts-persist-reload');
+
+  // 20. 別タブの options でダミー PAT を保存 → storage.onChanged で送信ボタンが自動活性化
   await optionsPage.fill('#pat-input', DUMMY_PAT);
   await optionsPage.click('#save');
   await optionsPage.waitForFunction(
@@ -459,43 +630,41 @@ try {
   await page.waitForFunction(
     () => {
       const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
-      const submit = shadow?.querySelector('.comment-submit');
+      const submit = shadow?.querySelector('.review-submit');
       return !!submit && submit.disabled === false;
     },
     undefined,
     { timeout: 10_000 }
   );
-  const afterPat = await readDetail();
+  const enabledDrafts = await readDrafts();
   record(
-    'comment: submit auto-enabled after PAT saved (storage.onChanged)',
-    afterPat.submitDisabled === false && !afterPat.authNoticeVisible &&
-      afterPat.commentTarget.includes('にコメントされます'),
-    `disabled=${afterPat.submitDisabled} target="${afterPat.commentTarget}"`
+    'drafts: submit auto-enabled after PAT saved (storage.onChanged)',
+    enabledDrafts.submitDisabled === false && !enabledDrafts.authVisible &&
+      enabledDrafts.submitLabel === '2 件の下書きをまとめて送信',
+    `submitDisabled=${enabledDrafts.submitDisabled} label="${enabledDrafts.submitLabel}"`
   );
-  await shot(page, '13-comment-enabled-with-pat');
+  await shot(page, '16-drafts-submit-enabled');
 
-  // 17. 投稿実行 → 無効 PAT なので 401 が人間可読で表示されること（実投稿はされない）
-  await page.locator('#functions-tree-panel-host .comment-submit').click();
+  // 21. まとめて送信 → 無効 PAT なので 401 が人間可読で表示され、下書きは消えないこと
+  //     （実 PR への投稿はされない）
+  await page.locator('#functions-tree-panel-host .review-submit').click();
   await page.waitForFunction(
     () => {
       const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
-      const el = shadow?.querySelector('.comment-status');
+      const el = shadow?.querySelector('.review-status');
       return !!el && el.dataset.state !== 'posting' && (el.textContent ?? '') !== '';
     },
     undefined,
     { timeout: 30_000 }
   );
-  const postResult = await page.evaluate(() => {
-    const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
-    const el = shadow?.querySelector('.comment-status');
-    return { state: el?.dataset.state ?? '', text: (el?.textContent ?? '').trim() };
-  });
+  const submitResult = await readDrafts();
   record(
-    'comment: post with invalid PAT -> human-readable 401 error',
-    postResult.state === 'error' && postResult.text.includes('PAT が無効'),
-    `state=${postResult.state} text="${postResult.text}"`
+    'review: submit with invalid PAT -> human-readable 401, drafts kept',
+    submitResult.statusState === 'error' && submitResult.statusText.includes('PAT が無効') &&
+      submitResult.count === '2' && submitResult.items.length === 2,
+    `state=${submitResult.statusState} text="${submitResult.statusText}" count=${submitResult.count}`
   );
-  await shot(page, '14-comment-post-401');
+  await shot(page, '17-review-submit-401-drafts-kept');
 
   // 後始末: ダミー PAT を削除
   await optionsPage.click('#delete');
@@ -544,7 +713,7 @@ try {
     (outsideKey.tag === 'INPUT' || outsideKey.tag === 'TEXTAREA') && !outsideKey.onPanelHost,
     `activeElement=${outsideKey.tag} "${outsideKey.hint}"`
   );
-  await shot(page, '15-files-tab-t-outside-panel');
+  await shot(page, '18-files-tab-t-outside-panel');
   // 後始末: フォーカスを外す（開いたオーバーレイがあれば Escape で閉じる）
   await page.keyboard.press('Escape');
   await page.evaluate(() => {
@@ -563,6 +732,8 @@ try {
     .first()
     .waitFor({ timeout: 30_000 });
   await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
+  // このノードには下書きがありフォームにプリフィルされるため、空にしてから打鍵する
+  await page.locator('#functions-tree-panel-host .comment-input').fill('');
   await page.locator('#functions-tree-panel-host .comment-input').click();
   await page.keyboard.type('t');
   const panelKey = await page.evaluate(() => {
@@ -582,7 +753,7 @@ try {
     `value="${panelKey.value}" focusOnHost=${panelKey.focusOnHost} ` +
       `activeElement=${panelKey.activeTag} "${panelKey.activeHint}"`
   );
-  await shot(page, '16-files-tab-t-in-panel');
+  await shot(page, '19-files-tab-t-in-panel');
 } catch (e) {
   record('e2e run', false, e.message);
 } finally {

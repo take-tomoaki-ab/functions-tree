@@ -8,8 +8,16 @@ import {
   getPrFiles,
   getPrInfo,
   postReviewComment,
+  submitReview,
   testAuth,
 } from './github-api';
+
+// content script（panel）がレビュー下書きを chrome.storage.session に退避できるようにする。
+// session 領域はデフォルトで trusted context（SW / options）専用のため、明示的に開放が必要。
+// SW 起動のたびに実行される（設定はブラウザセッション内で保持される）。
+void chrome.storage.session.setAccessLevel({
+  accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS',
+});
 
 // MV3 の注意: 非同期に応答する場合は listener から true を返して
 // sendResponse を後から呼ぶ。false を返すと応答チャネルが即座に閉じる。
@@ -50,6 +58,13 @@ chrome.runtime.onMessage.addListener(
           path: message.path,
           line: message.line,
           body: message.body,
+        }).then(sendResponse);
+        return true;
+      }
+      case 'SUBMIT_REVIEW': {
+        void submitReview(message.pr, {
+          commitId: message.commitId,
+          comments: message.comments,
         }).then(sendResponse);
         return true;
       }

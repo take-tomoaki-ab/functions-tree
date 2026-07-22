@@ -3,7 +3,8 @@
 GitHub の PR ページ上で、関数の依存関係グラフを mermaid で表示する Chrome 拡張機能（Manifest V3）。
 
 - 関数の依存関係抽出は tree-sitter（WASM）による静的解析で行う
-- ノードクリックで関数の中身の表示・レビューコメントの入力（GitHub のインラインコメントに同期）
+- ノードクリックで関数の中身の表示・レビューコメントの下書き入力。下書きは複数ノード・
+  複数ファイル分を溜めて、**1 つのレビューとしてまとめて送信**する（GitHub Reviews API）
 
 ## 開発
 
@@ -35,8 +36,9 @@ npx playwright install chromium
 npm run e2e -- --repo honojs/hono --pr 5140
 # 実 PR ページでボタン注入 / mermaid グラフ描画（色分け・凡例）/ ノードクリック → 詳細 /
 # フィルタトグル / SW キャッシュ / options の PAT 保存・削除 / SPA 遷移 /
-# コメント UI（未認証で無効 + PAT 導線、pat_required、無効 PAT での 401 表示）を確認
-# ※ 実 PR へのコメント投稿は行わない（無効 PAT の 401 経路までを自動確認する）
+# 下書きキュー（追加・編集・削除・開き直し / リロード後の復元）/
+# まとめて送信（未認証で無効 + PAT 導線、pat_required、無効 PAT での 401 + 下書き保持）を確認
+# ※ 実 PR へのレビュー投稿は行わない（無効 PAT の 401 経路までを自動確認する）
 ```
 
 E2E は未認証レート制限（60 req/h、IP 単位）を消費する。`--pr` で対応言語のファイルを
@@ -82,8 +84,9 @@ src/
     ├── github.ts        # GitHub API の共有型 + エラーの日本語化
     ├── graph.ts         # コールグラフの共有型（ノード / エッジ / スキップ情報）
     ├── languages.ts     # 対応言語のメタデータ（id / 表示名 / 拡張子）
+    ├── review-drafts.ts # レビュー下書きキューの純粋ロジック（upsert / 削除 / 検証 / Reviews API ボディ組み立て。テスト対象）
     └── settings.ts      # PAT の chrome.storage.local 読み書き
-test/                    # analyzer-core（TS/Go/Python）/ diff-lines / mermaid-source のテスト + fixtures*/
+test/                    # analyzer-core（TS/Go/Python）/ diff-lines / mermaid-source / review-drafts のテスト + fixtures*/
 scripts/e2e.mjs          # Playwright Chromium での自動動作確認
 wasm/ (dist 内)          # web-tree-sitter + tree-sitter-{typescript,tsx,go,python} の wasm（ビルド時にコピー）
 ```
@@ -122,15 +125,25 @@ wasm/ (dist 内)          # web-tree-sitter + tree-sitter-{typescript,tsx,go,pyt
   （content.js 本体は約 23KB のまま）。レンダラーは `GraphRenderer` インターフェースで
   差し替え可能（将来の Cytoscape.js 移行口）
 
-## レビューコメント投稿（Phase 5 時点）
+## レビューコメント（Phase 5 で行マッピング、batch-review-comments でまとめて送信化）
 
 - `GET /pulls/{n}/files` の patch をパースし、**RIGHT サイド（head）でコメント可能な
   行番号集合**（追加行 + 文脈行）を作成（`diff-lines.ts`）。関数の行範囲と突き合わせて
   各ノードに `commentableLines` / `commentLine`（推奨行 = 範囲内の最初の追加行、
   なければ最初の文脈行）を載せる
 - コメント可能ノードは対象行を表示（複数候補があれば select で選択可）し、
-  `POST /repos/{owner}/{repo}/pulls/{n}/comments`（`commit_id` = 解析に使った headSha、
-  `side: 'RIGHT'`）で通常のインラインコメントとして投稿。成功時は `html_url` へのリンクを表示
-- 投稿不可の理由を UI に明示: diff 外 / 変更ファイル内だが関数無変更 / PAT 未設定
-  （ボタン無効 + 「PAT を設定する」導線。PAT を保存すると `storage.onChanged` で自動活性化）
+  「**下書きに追加**」でパネル内のキューに溜める（この時点では送信されない）。
+  同一ノードの下書きは編集・削除でき、下書きのあるノードはグラフ上にオレンジ枠でマークされる
+- パネル下部の**下書き一覧**（件数バッジ / ノード名 / path:line / 本文プレビュー / 編集・削除）から
+  「**n 件の下書きをまとめて送信**」で `POST /repos/{owner}/{repo}/pulls/{n}/reviews`
+  （`commit_id` = 解析に使った headSha、`event: 'COMMENT'`、`comments[]` は `side: 'RIGHT'`）に
+  **1 回の API 呼び出しで 1 つのレビューとして投稿**する。成功時は `html_url` へのリンクを表示
+- 失敗時（422 で特定行が invalid 等）はエラーを人間可読で表示し、**下書きは消さない**
+  （修正して再送できる）。単発投稿の `POST_REVIEW_COMMENT` も background には残っている（UI 未使用）
+- 下書きキューは `chrome.storage.session` に `reviewDrafts:owner/repo#pr` キーで退避され、
+  SPA 遷移・パネルの開き直し・ページリロードでも消えない（PR ごとに別キュー。
+  content から session 領域を使うため SW 起動時に `setAccessLevel` で開放している）
+- 投稿不可の理由を UI に明示: diff 外 / 変更ファイル内だが関数無変更。送信ボタンは
+  PAT 未設定なら無効 + 「PAT を設定する」導線（保存すると `storage.onChanged` で自動活性化）。
+  下書きの**追加自体は PAT 不要**（必要なのは送信時だけ）
 - PAT 未設定時は background 側でも `pat_required` の型付きエラーで拒否（二重防御）

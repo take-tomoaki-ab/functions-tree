@@ -8,6 +8,14 @@ import { describeGithubError } from '../shared/github';
 import type { FunctionGraph, GraphNode } from '../shared/graph';
 import type { PrRef } from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
+import type { ReviewDraft } from '../shared/review-drafts';
+import {
+  draftStorageKey,
+  findDraft,
+  parseDrafts,
+  removeDraft,
+  upsertDraft,
+} from '../shared/review-drafts';
 import { getPat, PAT_KEY } from '../shared/settings';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
@@ -131,6 +139,10 @@ const PANEL_CSS = `
   background: #f6f8fa;
   border: 1px dashed #8c959f;
 }
+.legend-chip.chip-draft {
+  background: #fff1e5;
+  border: 2px solid #bc4c00;
+}
 .auth-notice {
   display: none;
   align-items: center;
@@ -192,6 +204,16 @@ const PANEL_CSS = `
   margin: 0;
   color: #59636e;
   font-size: 12px;
+}
+/* 下書きノード / 選択ノードの強調。実際の描画は mermaid-view の applyHighlights が
+   インラインスタイルで当てる（mermaid の classDef が #svgId + !important の CSS を
+   SVG 内に埋めるため、ここからは specificity で勝てない）。以下はレンダラーを
+   差し替えたとき用のフォールバック */
+.graph-area g.node.has-draft rect,
+.graph-area g.node.has-draft polygon,
+.graph-area g.node.has-draft path {
+  stroke: #bc4c00 !important;
+  stroke-width: 3px !important;
 }
 /* 選択中ノードの強調（mermaid が生成した SVG の g.node に .selected を付ける） */
 .graph-area g.node.selected rect,
@@ -380,6 +402,170 @@ const PANEL_CSS = `
 @media (prefers-color-scheme: dark) {
   .out-diff-badge { color: #9198a1; }
 }
+.draft-remove {
+  margin-top: 6px;
+  margin-left: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid rgba(209, 36, 47, 0.5);
+  border-radius: 6px;
+  background: transparent;
+  color: #d1242f;
+  cursor: pointer;
+}
+.draft-remove[hidden] { display: none; }
+@media (prefers-color-scheme: dark) {
+  .draft-remove { color: #f85149; }
+}
+.drafts-pane {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  max-height: 200px;
+  padding: 8px 12px;
+  border-top: 1px solid rgba(140, 149, 159, 0.3);
+  font-size: 12px;
+}
+.drafts-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.drafts-title {
+  font-weight: 600;
+}
+.drafts-count {
+  min-width: 18px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  color: #ffffff;
+  background: #bc4c00;
+  border-radius: 999px;
+}
+.drafts-count[data-empty="true"] { background: rgba(140, 149, 159, 0.6); }
+.review-submit {
+  margin-left: auto;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid rgba(31, 136, 61, 0.6);
+  border-radius: 6px;
+  background: #1f883d;
+  color: #ffffff;
+  cursor: pointer;
+}
+.review-submit:disabled {
+  border-color: rgba(140, 149, 159, 0.5);
+  background: rgba(140, 149, 159, 0.15);
+  color: #59636e;
+  cursor: not-allowed;
+}
+.drafts-auth {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  color: #9a6700;
+  background: rgba(212, 167, 44, 0.15);
+  border: 1px solid rgba(212, 167, 44, 0.4);
+  border-radius: 6px;
+}
+.drafts-auth[data-visible="true"] { display: flex; }
+.review-status {
+  margin: 6px 0 0;
+}
+.review-status:empty { display: none; }
+.review-status[data-state="posting"] { color: #59636e; }
+.review-status[data-state="ok"] { color: #1a7f37; }
+.review-status[data-state="error"] { color: #d1242f; }
+.review-status a { color: #0969da; }
+@media (prefers-color-scheme: dark) {
+  .drafts-auth { color: #d29922; }
+  .review-status[data-state="posting"] { color: #9198a1; }
+  .review-status[data-state="ok"] { color: #3fb950; }
+  .review-status[data-state="error"] { color: #f85149; }
+  .review-status a { color: #4493f8; }
+}
+.drafts-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+}
+.drafts-empty {
+  color: #59636e;
+}
+@media (prefers-color-scheme: dark) {
+  .drafts-empty { color: #9198a1; }
+}
+.draft-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.draft-item + .draft-item {
+  border-top: 1px dashed rgba(140, 149, 159, 0.3);
+}
+.draft-node-name {
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  word-break: break-all;
+}
+.draft-loc {
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #59636e;
+}
+.draft-preview {
+  flex: 1;
+  min-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #59636e;
+}
+@media (prefers-color-scheme: dark) {
+  .draft-loc { color: #9198a1; }
+  .draft-preview { color: #9198a1; }
+}
+.draft-edit,
+.draft-delete {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid rgba(140, 149, 159, 0.5);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.draft-edit:hover,
+.draft-delete:hover {
+  background: rgba(140, 149, 159, 0.2);
+}
+.draft-edit:disabled {
+  color: #59636e;
+  cursor: not-allowed;
+}
+.draft-delete {
+  border-color: rgba(209, 36, 47, 0.5);
+  color: #d1242f;
+}
+@media (prefers-color-scheme: dark) {
+  .draft-delete { color: #f85149; }
+}
 `;
 
 let panelHost: HTMLElement | null = null;
@@ -388,7 +574,18 @@ let authNoticeEl: HTMLElement | null = null;
 let graphAreaEl: HTMLElement | null = null;
 let sidePaneEl: HTMLElement | null = null;
 let nodeCountEl: HTMLElement | null = null;
+let draftsListEl: HTMLElement | null = null;
+let draftsCountEl: HTMLElement | null = null;
+let reviewSubmitEl: HTMLButtonElement | null = null;
+let reviewStatusEl: HTMLElement | null = null;
+let draftsAuthEl: HTMLElement | null = null;
 let currentPr: PrRef | null = null;
+
+// レビュー下書きキュー。ここが正で、変更のたびに chrome.storage.session へ退避する
+// （SPA 遷移でパネルが破棄・再注入されても復元できる。キーは PR ごと）。
+let drafts: ReviewDraft[] = [];
+// SUBMIT_REVIEW の送信中フラグ（二重送信防止）
+let submitting = false;
 
 let currentGraph: FunctionGraph | null = null;
 /** 解析に使った head コミット SHA（コメント投稿の commit_id に使う） */
@@ -407,6 +604,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   const v = changes[PAT_KEY].newValue as unknown;
   patConfigured = typeof v === 'string' && v.length > 0;
   commentUiUpdater?.();
+  renderDrafts(); // まとめて送信ボタンの活性・PAT 導線も追従させる
 });
 // フィルタ初期値: 孤立ノード（エッジなし）が多いグラフでも見やすいよう、
 // 「エッジのあるノードのみ」をデフォルト ON にする
@@ -567,7 +765,8 @@ function buildPanel(): HTMLElement {
   legend.append(
     createLegendItem('chip-commentable', 'コメント可（diff の行）'),
     createLegendItem('chip-in-diff', '変更ファイル内（関数は無変更）'),
-    createLegendItem('chip-dep', '依存先（diff 外）')
+    createLegendItem('chip-dep', '依存先（diff 外）'),
+    createLegendItem('chip-draft', '下書きあり')
   );
   toolbar.append(legend);
 
@@ -597,9 +796,198 @@ function buildPanel(): HTMLElement {
   main.append(graphAreaEl, sidePaneEl);
   renderSidePlaceholder();
 
-  panel.append(header, toolbar, authNoticeEl, statusEl, main);
+  panel.append(header, toolbar, authNoticeEl, statusEl, main, buildDraftsPane());
   shadow.appendChild(panel);
   return host;
+}
+
+/** パネル下部の下書き一覧ペイン（件数バッジ / 一覧 / まとめて送信）を組み立てる */
+function buildDraftsPane(): HTMLElement {
+  const pane = document.createElement('div');
+  pane.className = 'drafts-pane';
+
+  const header = document.createElement('div');
+  header.className = 'drafts-header';
+  const title = document.createElement('span');
+  title.className = 'drafts-title';
+  title.textContent = '下書き';
+  draftsCountEl = document.createElement('span');
+  draftsCountEl.className = 'drafts-count';
+  reviewSubmitEl = document.createElement('button');
+  reviewSubmitEl.className = 'review-submit';
+  reviewSubmitEl.type = 'button';
+  reviewSubmitEl.addEventListener('click', submitAllDrafts);
+  header.append(title, draftsCountEl, reviewSubmitEl);
+
+  draftsAuthEl = document.createElement('div');
+  draftsAuthEl.className = 'drafts-auth';
+  const authText = document.createElement('span');
+  authText.textContent = 'まとめて送信には PAT が必要です。';
+  const openOptions = document.createElement('button');
+  openOptions.className = 'open-options';
+  openOptions.type = 'button';
+  openOptions.textContent = 'PAT を設定する';
+  openOptions.addEventListener('click', () => {
+    void sendToBackground({ type: 'OPEN_OPTIONS' });
+  });
+  draftsAuthEl.append(authText, openOptions);
+
+  reviewStatusEl = document.createElement('p');
+  reviewStatusEl.className = 'review-status';
+
+  draftsListEl = document.createElement('ul');
+  draftsListEl.className = 'drafts-list';
+
+  pane.append(header, draftsAuthEl, reviewStatusEl, draftsListEl);
+  renderDrafts();
+  return pane;
+}
+
+/** 下書き一覧・件数バッジ・送信ボタン・グラフ上のマークを現在の drafts に同期する */
+function renderDrafts(): void {
+  if (!draftsListEl || !draftsCountEl || !reviewSubmitEl || !draftsAuthEl) return;
+  draftsCountEl.textContent = String(drafts.length);
+  draftsCountEl.dataset.empty = drafts.length === 0 ? 'true' : 'false';
+  reviewSubmitEl.textContent = submitting
+    ? '送信中…'
+    : `${drafts.length} 件の下書きをまとめて送信`;
+  reviewSubmitEl.disabled = submitting || drafts.length === 0 || !patConfigured;
+  draftsAuthEl.dataset.visible =
+    !patConfigured && drafts.length > 0 ? 'true' : 'false';
+  if (drafts.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'drafts-empty';
+    empty.textContent =
+      '下書きはありません。コメント可（緑）のノードから「下書きに追加」できます。';
+    draftsListEl.replaceChildren(empty);
+  } else {
+    draftsListEl.replaceChildren(...drafts.map(buildDraftItem));
+  }
+  renderHandle?.setDraftMarks(new Set(drafts.map((d) => d.nodeId)));
+}
+
+/** 下書き一覧の 1 行（ノード名 / path:line / 本文プレビュー / 編集 / 削除） */
+function buildDraftItem(draft: ReviewDraft): HTMLElement {
+  const item = document.createElement('li');
+  item.className = 'draft-item';
+
+  const name = document.createElement('span');
+  name.className = 'draft-node-name';
+  name.textContent = draft.nodeName;
+
+  const loc = document.createElement('span');
+  loc.className = 'draft-loc';
+  loc.textContent = `${draft.path}:L${draft.line}`;
+  loc.title = `${draft.path}:L${draft.line}`;
+
+  const preview = document.createElement('span');
+  preview.className = 'draft-preview';
+  preview.textContent = draft.body.replace(/\s+/g, ' ');
+  preview.title = draft.body;
+
+  const edit = document.createElement('button');
+  edit.className = 'draft-edit';
+  edit.type = 'button';
+  edit.textContent = '編集';
+  const node = currentGraph?.nodes.find((n) => n.id === draft.nodeId);
+  if (node) {
+    // 編集 = 対象ノードを選択してフォームに下書きをプリフィルする
+    edit.addEventListener('click', () => selectNode(node));
+  } else {
+    // 再解析（push 等で headSha が変わった）後のグラフに同じノードがない場合
+    edit.disabled = true;
+    edit.title = '現在のグラフにこのノードが見つかりません（削除して作り直してください）';
+  }
+
+  const del = document.createElement('button');
+  del.className = 'draft-delete';
+  del.type = 'button';
+  del.textContent = '削除';
+  del.addEventListener('click', () => {
+    drafts = removeDraft(drafts, draft.nodeId);
+    persistDrafts();
+    renderDrafts();
+    // 対象ノードのフォームを開いていたらボタン表示（追加/更新・削除）を追従させる
+    commentUiUpdater?.();
+  });
+
+  item.append(name, loc, preview, edit, del);
+  return item;
+}
+
+/**
+ * 溜めた下書きを 1 回の SUBMIT_REVIEW（POST /pulls/{n}/reviews）でまとめて送信する。
+ * 成功時のみキューをクリアし、失敗時（422 で特定行が invalid 等）は下書きを残す
+ * （ユーザーが修正して再送できる）。
+ */
+function submitAllDrafts(): void {
+  if (submitting || drafts.length === 0 || !currentPr || !currentHeadSha) return;
+  if (!reviewStatusEl) return;
+  submitting = true;
+  reviewStatusEl.dataset.state = 'posting';
+  reviewStatusEl.textContent = `${drafts.length} 件のコメントを 1 つのレビューとして送信中…`;
+  renderDrafts();
+  void sendToBackground({
+    type: 'SUBMIT_REVIEW',
+    pr: currentPr,
+    commitId: currentHeadSha,
+    comments: drafts.map(({ path, line, body }) => ({ path, line, body })),
+  })
+    .then((res) => {
+      submitting = false;
+      if (!reviewStatusEl) return; // パネルが閉じられた
+      if (res.ok) {
+        drafts = [];
+        persistDrafts();
+        reviewStatusEl.dataset.state = 'ok';
+        reviewStatusEl.textContent = 'レビューを投稿しました: ';
+        const link = document.createElement('a');
+        link.href = res.value.htmlUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = 'PR で見る';
+        reviewStatusEl.appendChild(link);
+        // 選択中ノードのフォームのボタン表示（更新 → 追加）も戻す
+        commentUiUpdater?.();
+      } else {
+        reviewStatusEl.dataset.state = 'error';
+        reviewStatusEl.textContent = describeGithubError(res.error);
+      }
+      renderDrafts();
+    })
+    .catch((e: unknown) => {
+      submitting = false;
+      if (!reviewStatusEl) return;
+      reviewStatusEl.dataset.state = 'error';
+      reviewStatusEl.textContent = `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`;
+      renderDrafts();
+    });
+}
+
+/**
+ * chrome.storage.session から現在の PR の下書きを読み戻す。
+ * session 領域は SW が setAccessLevel で開放するまで content から触れないため、
+ * 失敗したら少し待って 1 回だけ再試行する（それでもダメなら空キューで開始）。
+ */
+async function loadDraftsFromSession(pr: PrRef): Promise<ReviewDraft[]> {
+  const key = draftStorageKey(pr);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const items = await chrome.storage.session.get(key);
+      return parseDrafts(items[key]);
+    } catch {
+      if (attempt >= 1) return [];
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+}
+
+/** 下書きキューを chrome.storage.session に退避する（失敗しても送信フローには影響しない） */
+function persistDrafts(): void {
+  if (!currentPr) return;
+  void chrome.storage.session
+    .set({ [draftStorageKey(currentPr)]: drafts })
+    .catch(() => undefined);
 }
 
 function renderSidePlaceholder(): void {
@@ -664,18 +1052,22 @@ function renderNodeDetail(node: GraphNode): void {
 }
 
 /**
- * コメント可能ノード用の投稿フォームを組み立てる。
+ * コメント可能ノード用の下書きフォームを組み立てる。
+ * - 「下書きに追加」は即送信しない（パネル下部のキューに溜まり、まとめて 1 レビューで送信）。
+ *   PAT は送信時にだけ必要なので、追加ボタンの活性条件は「本文が空でない」だけ
  * - 対象行の表示（commentableLines が複数なら select で選択可能。既定は commentLine =
  *   関数範囲内の最初の追加行、なければ最初のコメント可能行）
- * - 投稿ボタンは「PAT 設定済み かつ 本文が空でない」ときだけ活性
- *   （PAT 未設定時は background 側でも pat_required で拒否する二重防御）
- * - 成功時は作成されたコメントの html_url リンク、失敗時は人間可読エラーを表示
+ * - このノードの下書きが既にあれば本文・行をプリフィルし、「下書きを更新」「下書きを削除」になる
  */
 function buildCommentForm(node: GraphNode): HTMLElement {
   const form = document.createElement('div');
   form.className = 'comment-form';
 
-  const defaultLine = node.commentLine ?? node.commentableLines[0];
+  const existing = findDraft(drafts, node.id);
+  const defaultLine =
+    existing !== undefined && node.commentableLines.includes(existing.line)
+      ? existing.line
+      : (node.commentLine ?? node.commentableLines[0]);
   let selectedLine = defaultLine;
 
   const target = document.createElement('p');
@@ -706,84 +1098,62 @@ function buildCommentForm(node: GraphNode): HTMLElement {
 
   const input = document.createElement('textarea');
   input.className = 'comment-input';
-  input.placeholder = 'この関数へのレビューコメント…（Markdown 可）';
+  input.placeholder =
+    'この関数へのレビューコメント…（Markdown 可。まとめて送信するまで投稿されません）';
+  if (existing) input.value = existing.body;
 
   const submit = document.createElement('button');
-  submit.className = 'comment-submit';
+  submit.className = 'comment-submit draft-add';
   submit.type = 'button';
-  submit.textContent = 'コメント投稿';
 
-  const authNotice = document.createElement('div');
-  authNotice.className = 'comment-auth';
-  const authText = document.createElement('span');
-  authText.textContent = 'コメント投稿には PAT が必要です。';
-  const openOptions = document.createElement('button');
-  openOptions.className = 'open-options';
-  openOptions.type = 'button';
-  openOptions.textContent = 'PAT を設定する';
-  openOptions.addEventListener('click', () => {
-    void sendToBackground({ type: 'OPEN_OPTIONS' });
-  });
-  authNotice.append(authText, openOptions);
+  const remove = document.createElement('button');
+  remove.className = 'draft-remove';
+  remove.type = 'button';
+  remove.textContent = '下書きを削除';
 
   const status = document.createElement('p');
   status.className = 'comment-status';
 
-  let posting = false;
   const update = (): void => {
-    submit.disabled = posting || !patConfigured || input.value.trim() === '';
-    submit.textContent = posting ? '投稿中…' : 'コメント投稿';
-    authNotice.dataset.visible = patConfigured ? 'false' : 'true';
+    const hasDraft = findDraft(drafts, node.id) !== undefined;
+    submit.textContent = hasDraft ? '下書きを更新' : '下書きに追加';
+    submit.disabled = input.value.trim() === '';
+    remove.hidden = !hasDraft;
   };
   input.addEventListener('input', update);
 
   submit.addEventListener('click', () => {
-    if (posting || !currentPr || !currentHeadSha) return;
     const body = input.value.trim();
     if (body === '') return;
-    posting = true;
-    status.dataset.state = 'posting';
-    status.textContent = '投稿中…';
-    update();
-    void sendToBackground({
-      type: 'POST_REVIEW_COMMENT',
-      pr: currentPr,
-      commitId: currentHeadSha,
+    const wasUpdate = findDraft(drafts, node.id) !== undefined;
+    drafts = upsertDraft(drafts, {
+      nodeId: node.id,
+      nodeName: node.name,
       path: node.filePath,
       line: selectedLine,
       body,
-    })
-      .then((res) => {
-        posting = false;
-        if (!form.isConnected) return; // 投稿中にノード切替 / パネルが閉じられた
-        if (res.ok) {
-          status.dataset.state = 'ok';
-          status.textContent = 'コメントを投稿しました: ';
-          const link = document.createElement('a');
-          link.href = res.value.htmlUrl;
-          link.target = '_blank';
-          link.rel = 'noopener noreferrer';
-          link.textContent = 'PR で見る';
-          status.appendChild(link);
-          input.value = '';
-        } else {
-          status.dataset.state = 'error';
-          status.textContent = describeGithubError(res.error);
-        }
-        update();
-      })
-      .catch((e: unknown) => {
-        posting = false;
-        if (!form.isConnected) return;
-        status.dataset.state = 'error';
-        status.textContent = `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`;
-        update();
-      });
+    });
+    persistDrafts();
+    renderDrafts();
+    status.dataset.state = 'ok';
+    status.textContent = wasUpdate
+      ? '下書きを更新しました（まだ送信されていません）'
+      : '下書きに追加しました（まだ送信されていません）';
+    update();
+  });
+
+  remove.addEventListener('click', () => {
+    drafts = removeDraft(drafts, node.id);
+    persistDrafts();
+    renderDrafts();
+    delete status.dataset.state;
+    status.textContent = '下書きを削除しました';
+    update();
   });
 
   commentUiUpdater = update;
   update();
-  form.append(target, input, submit, authNotice, status);
+  form.append(target, input, submit, remove, status);
   return form;
 }
 
@@ -824,6 +1194,7 @@ async function renderGraph(): Promise<void> {
     if (token !== renderToken || !panelHost) return;
     renderHandle = handle;
     if (selectedNode) handle.setSelected(selectedNode.id);
+    handle.setDraftMarks(new Set(drafts.map((d) => d.nodeId)));
   } catch (e) {
     if (token !== renderToken || !statusEl) return;
     statusEl.dataset.state = 'error';
@@ -870,11 +1241,28 @@ function openPanel(): void {
   currentGraph = null;
   currentHeadSha = null;
   renderHandle = null;
-  // コメント投稿ボタンの活性条件。以後の変更は storage.onChanged が追従する
+  drafts = [];
+  submitting = false;
+  // まとめて送信ボタンの活性条件。以後の変更は storage.onChanged が追従する
   void getPat().then((pat) => {
     patConfigured = pat !== null;
     commentUiUpdater?.();
+    renderDrafts();
   });
+  // 下書きキューを chrome.storage.session から復元する（SPA 遷移・開き直しでも残る）。
+  // PING で SW を先に起こす = session 領域の setAccessLevel（SW 起動時に実行）を確実にする
+  const pr = currentPr;
+  void sendToBackground({ type: 'PING', pr })
+    .catch(() => undefined)
+    .then(() => loadDraftsFromSession(pr))
+    .then((loaded) => {
+      // 読み戻し中にパネルが閉じられた / 別 PR に移っていたら捨てる
+      if (!panelHost || currentPr !== pr) return;
+      drafts = loaded;
+      renderDrafts();
+      // 選択中ノードのフォームがあればプリフィル状態を追従させる
+      if (selectedNode) renderNodeDetail(selectedNode);
+    });
   panelHost = buildPanel();
   // トグルボタンを覆ってしまわないよう、パネルはボタンの下端から開く
   const button = document.getElementById(BUTTON_ID);
@@ -894,11 +1282,19 @@ function closePanel(): void {
   graphAreaEl = null;
   sidePaneEl = null;
   nodeCountEl = null;
+  draftsListEl = null;
+  draftsCountEl = null;
+  reviewSubmitEl = null;
+  reviewStatusEl = null;
+  draftsAuthEl = null;
   currentGraph = null;
   currentHeadSha = null;
   selectedNode = null;
   renderHandle = null;
   commentUiUpdater = null;
+  // drafts は chrome.storage.session に退避済み。次に開いたとき復元される
+  drafts = [];
+  submitting = false;
   renderToken++;
 }
 

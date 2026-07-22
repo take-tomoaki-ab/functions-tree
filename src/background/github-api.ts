@@ -10,9 +10,12 @@ import type {
   PrFile,
   PrFilesPayload,
   PrInfo,
+  ReviewCommentInput,
   ReviewCommentPayload,
+  ReviewSubmitPayload,
 } from '../shared/github';
 import type { PrRef } from '../shared/messages';
+import { buildReviewRequestBody } from '../shared/review-drafts';
 import { getPat } from '../shared/settings';
 
 const API_BASE = 'https://api.github.com';
@@ -297,6 +300,50 @@ export async function postReviewComment(
       line: params.line,
       side: 'RIGHT',
     }
+  );
+  if (!r.ok) return r;
+  const json = (await r.res.json()) as { html_url: string; id: number };
+  return {
+    ok: true,
+    authMode: r.authMode,
+    value: { htmlUrl: json.html_url, id: json.id },
+  };
+}
+
+/**
+ * POST /repos/{owner}/{repo}/pulls/{n}/reviews — 溜めた下書きを 1 つのレビューとして
+ * まとめて投稿する。event: 'COMMENT' なので approve / request changes にはならない。
+ * 各コメントの line は diff（patch）の RIGHT サイドに含まれる行であること。
+ * 1 行でも invalid だと 422 で全体が失敗する（部分投稿はされない）ため、
+ * 呼び出し側は失敗時に下書きを消さずユーザーが修正して再送できるようにする。
+ * PAT 未設定なら API を呼ばずに kind: 'pat_required' を返す（UI 側と二重防御）。
+ */
+export async function submitReview(
+  pr: PrRef,
+  params: { commitId: string; comments: ReviewCommentInput[] }
+): Promise<GithubResult<ReviewSubmitPayload>> {
+  const pat = await getPat();
+  if (!pat) {
+    return {
+      ok: false,
+      authMode: 'anonymous',
+      error: {
+        kind: 'pat_required',
+        message: 'レビュー投稿には PAT の設定が必要です',
+      },
+    };
+  }
+  if (params.comments.length === 0) {
+    return {
+      ok: false,
+      authMode: 'pat',
+      error: { kind: 'unexpected', message: '下書きが 1 件もありません' },
+    };
+  }
+  const r = await apiRequest(
+    'POST',
+    `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews`,
+    buildReviewRequestBody(params.commitId, params.comments)
   );
   if (!r.ok) return r;
   const json = (await r.res.json()) as { html_url: string; id: number };
