@@ -245,6 +245,33 @@ try {
   );
   await shot(page, '5b-commentable-node-anonymous');
 
+  // === bugfix/keyboard-shortcut-leak ===
+  // 6.4. パネル内のキー入力が shadow 境界を越えて document まで伝播しないこと。
+  //      GitHub のショートカットハンドラは document で listen しているため、
+  //      「document に keydown が届かない」= ショートカットが発動しない、の直接確認。
+  await page.evaluate(() => {
+    window.__ftLeakedKeys = [];
+    document.addEventListener('keydown', (e) => window.__ftLeakedKeys.push(e.key));
+  });
+  await page.locator('#functions-tree-panel-host .comment-input').click();
+  await page.keyboard.type('t');
+  const keyInPanel = await page.evaluate(() => {
+    const host = document.querySelector('#functions-tree-panel-host');
+    return {
+      leaked: window.__ftLeakedKeys.length,
+      value: host?.shadowRoot?.querySelector('.comment-input')?.value ?? '',
+      focusOnHost: document.activeElement === host,
+    };
+  });
+  record(
+    'keyboard: "t" in panel textarea does not leak keydown to document',
+    keyInPanel.leaked === 0 && keyInPanel.value === 't' && keyInPanel.focusOnHost,
+    `leaked=${keyInPanel.leaked} value="${keyInPanel.value}" focusOnHost=${keyInPanel.focusOnHost}`
+  );
+  await shot(page, '5b2-keyboard-in-panel-no-leak');
+  // 後始末: 入力を空に戻す（以降のコメント欄確認に影響させない）
+  await page.locator('#functions-tree-panel-host .comment-input').fill('');
+
   // 6.5. コメント不可ノード（diff 外 / 関数無変更）で理由が表示されること
   const nonCommentable = page.locator(
     '#functions-tree-panel-host .graph-area g.node:not(.commentable)'
@@ -477,6 +504,85 @@ try {
     undefined,
     { timeout: 10_000 }
   );
+
+  // === bugfix/keyboard-shortcut-leak: Files changed タブでの実挙動確認 ===
+  // GitHub の 't' ショートカットが実際に効くのは Files changed タブ
+  // （左側ファイルツリーの検索フィルタにフォーカスが移る）なので、そこで
+  // 「対照: パネル外では効く」「パネル内 textarea では効かない」の両方向を確認する。
+
+  // 18. 対照: パネル外で 't' → ファイル検索（ページ側 input）にフォーカスが移ること
+  //     （stopPropagation の入れすぎで GitHub 本来の挙動を壊していないことの確認）
+  await page.bringToFront();
+  await page.goto(`https://github.com${prHref}/files`, { waitUntil: 'domcontentloaded' });
+  await page.locator(BUTTON).waitFor({ timeout: 15_000 });
+  await page.keyboard.press('t');
+  // ショートカットによるフォーカス移動は非同期のことがあるため少し待つ
+  await page
+    .waitForFunction(
+      () => {
+        const el = document.activeElement;
+        return !!el && el !== document.body && el.id !== 'functions-tree-panel-host';
+      },
+      undefined,
+      { timeout: 5_000 }
+    )
+    .catch(() => {});
+  const outsideKey = await page.evaluate(() => {
+    const el = document.activeElement;
+    return {
+      tag: el?.tagName ?? '',
+      hint:
+        el?.getAttribute('placeholder') ??
+        el?.getAttribute('aria-label') ??
+        el?.id ??
+        '',
+      onPanelHost: el?.id === 'functions-tree-panel-host',
+    };
+  });
+  record(
+    'files tab: "t" outside panel focuses GitHub file search (baseline intact)',
+    (outsideKey.tag === 'INPUT' || outsideKey.tag === 'TEXTAREA') && !outsideKey.onPanelHost,
+    `activeElement=${outsideKey.tag} "${outsideKey.hint}"`
+  );
+  await shot(page, '15-files-tab-t-outside-panel');
+  // 後始末: フォーカスを外す（開いたオーバーレイがあれば Escape で閉じる）
+  await page.keyboard.press('Escape');
+  await page.evaluate(() => {
+    const el = document.activeElement;
+    if (el instanceof HTMLElement) el.blur();
+  });
+
+  // 19. パネルの textarea にフォーカスして 't' をタイプ
+  //     → GitHub のファイル検索は開かず（フォーカスはパネルのまま）、textarea に 't' が入ること
+  await page.locator(BUTTON).click();
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  await page.locator('#functions-tree-panel-host .filter-connected').click();
+  await page
+    .locator('#functions-tree-panel-host .graph-area g.node.commentable')
+    .first()
+    .waitFor({ timeout: 30_000 });
+  await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
+  await page.locator('#functions-tree-panel-host .comment-input').click();
+  await page.keyboard.type('t');
+  const panelKey = await page.evaluate(() => {
+    const host = document.querySelector('#functions-tree-panel-host');
+    const active = document.activeElement;
+    return {
+      value: host?.shadowRoot?.querySelector('.comment-input')?.value ?? '',
+      focusOnHost: active === host,
+      activeTag: active?.tagName ?? '',
+      activeHint:
+        active?.getAttribute('placeholder') ?? active?.getAttribute('aria-label') ?? active?.id ?? '',
+    };
+  });
+  record(
+    'files tab: "t" in panel textarea types into textarea, GitHub file search not triggered',
+    panelKey.value === 't' && panelKey.focusOnHost,
+    `value="${panelKey.value}" focusOnHost=${panelKey.focusOnHost} ` +
+      `activeElement=${panelKey.activeTag} "${panelKey.activeHint}"`
+  );
+  await shot(page, '16-files-tab-t-in-panel');
 } catch (e) {
   record('e2e run', false, e.message);
 } finally {

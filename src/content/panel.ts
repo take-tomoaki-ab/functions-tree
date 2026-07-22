@@ -519,6 +519,13 @@ function createLegendItem(chipClass: string, text: string): HTMLElement {
 function buildPanel(): HTMLElement {
   const host = document.createElement('div');
   host.id = PANEL_HOST_ID;
+  // GitHub はキーボードショートカット（例: 't' = ファイル検索）を document で listen
+  // しており、Shadow DOM 内の textarea 等で打ったキーも composed イベントとして host を
+  // 経由し document まで伝播して誤発動する。host で伝播だけ止める（preventDefault は
+  // しないので、パネル内の文字入力・Tab 移動などのデフォルト動作はそのまま生きる）。
+  for (const type of ['keydown', 'keyup', 'keypress'] as const) {
+    host.addEventListener(type, (e) => e.stopPropagation());
+  }
   const shadow = host.attachShadow({ mode: 'open' });
 
   const style = document.createElement('style');
