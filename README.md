@@ -1,149 +1,132 @@
 # functions-tree
 
-GitHub の PR ページ上で、関数の依存関係グラフを mermaid で表示する Chrome 拡張機能（Manifest V3）。
+GitHub の PR ページ上で、関数の依存関係グラフを表示する Chrome 拡張機能（Manifest V3）。
 
-- 関数の依存関係抽出は tree-sitter（WASM）による静的解析で行う
-- ノードクリックで関数の中身の表示・レビューコメントの下書き入力。下書きは複数ノード・
-  複数ファイル分を溜めて、**1 つのレビューとしてまとめて送信**する（GitHub Reviews API）
+PR の diff はファイル単位の変更しか見せてくれず、変更された関数がどこから呼ばれ、どこを呼んでいるのかは追いにくい。
+functions-tree は変更ファイルとその依存先を tree-sitter（WASM）で静的解析し、関数を頂点、呼び出しを辺とするコールグラフを PR ページ上に描画する。
+ノードをクリックすると関数本体をその場で読め、レビューコメントの下書きを書き溜めて、1 つのレビューとしてまとめて投稿できる。
 
-## 開発
+解析は LLM を使わない決定的な静的解析で、すべてブラウザ内で完結する。
+外部と通信するのは GitHub REST API だけで、コードの取得とレビュー投稿にのみ使う。
+
+## 主な機能
+
+- **コールグラフ表示**：mermaid（flowchart）で描画。コメント可否で 3 区分に色分けする（コメント可 = 緑、変更ファイル内だが関数は無変更 = 黄、diff 外の依存先 = グレー破線）。「エッジのあるノードのみ」「変更ファイル内のみ」のフィルタつき
+- **関数詳細**：ノードクリックでサイドペインに関数名、パスと行範囲、ソース全文を表示
+- **レビューコメントの一括投稿**：ノードごとにコメントを「下書きに追加」してキューに溜め、「n 件の下書きをまとめて送信」で 1 つのレビュー（インラインコメント群）として投稿する。下書きは PR 単位で保持され、パネルの開き直しやページリロードでも消えない
+- **多言語対応**：TypeScript / JavaScript、Go、Python
+
+| 言語 | 拡張子 | 解決できる呼び出し |
+|---|---|---|
+| TypeScript / JavaScript | .ts .tsx .js .jsx .mjs .cjs | 同一ファイル、相対 import（named / alias / namespace / default）、`this.method()` |
+| Go | .go | 同一パッケージ（ディレクトリ内の兄弟ファイルを自動展開）、go.mod の module パス基準のパッケージ import |
+| Python | .py | 同一ファイル、相対 import と絶対 import（src レイアウト推定つき、標準ライブラリは除外）、`self.method()` |
+
+## インストール
+
+ストア配布はしていないため、手元でビルドして読み込む。
+
+```sh
+npm ci --include=dev
+npm run build
+```
+
+`chrome://extensions` で「デベロッパー モード」を有効にし、「パッケージ化されていない拡張機能を読み込む」で `dist/` を選択する。
+
+## 使い方
+
+1. GitHub の PR ページを開くと、ヘッダー付近に「関数依存グラフ」ボタンが注入される
+2. ボタンを押すとパネルが開き、変更ファイルと深さ 1 の依存先を解析してグラフを描画する
+3. 緑のノードをクリックし、コメントを書いて「下書きに追加」する（この時点では投稿されない）
+4. 複数のノードやファイルに下書きを追加したら、「n 件の下書きをまとめて送信」で 1 つのレビューとして投稿する
+
+## PAT の設定
+
+拡張の options ページ（`chrome://extensions` → 詳細 → 拡張機能のオプション、またはパネル内の「PAT を設定する」）で GitHub Personal Access Token を設定する。
+
+- 未設定でも公開リポジトリの閲覧は動く（未認証モード。レート制限 60 req/h、レビュー投稿は不可）
+- 閲覧だけなら fine-grained PAT の `Contents` と `Pull requests` の Read で足りる。レビューを投稿するには `Pull requests` の Read and write（classic PAT なら `repo` スコープ、公開リポジトリのみなら `public_repo`）が必要
+- PAT は `chrome.storage.local` にのみ保存され、GitHub API 以外には送られない
+
+## 制限事項
+
+- コメントできるのは diff に含まれる行だけ（GitHub API の仕様）。グラフ上では色分けで区別され、コメント不可のノードには理由が表示される
+- コメントは単一行のみで、下書きは 1 ノードにつき 1 件
+- 依存を辿る深さは 1 に固定している（API リクエスト数と描画量を抑えるため）
+- 下書きの寿命はブラウザセッション（`chrome.storage.session`）。ブラウザを終了すると消える
+- 解析後に PR へ push があると、投稿時に 422 で失敗することがある（下書きは消えない。パネルを開き直すと新しいコミットで再解析される）
+- 外部パッケージの呼び出しや動的な呼び出しはグラフに含めない（未解決件数として集計のみ）
+
+## 仕組み
+
+content script は表示専任で、GitHub API の呼び出しと tree-sitter による解析はすべて background service worker が担う。
+UI は Shadow DOM に隔離し、GitHub 側の CSS やキーボードショートカットと干渉しない。
+
+1. PR ページでパネルを開くと、background が `GET /pulls/{n}/files` で変更ファイル一覧を取得する
+2. 変更ファイルと、相対 import 等で辿れる深さ 1 の依存ファイルを `GET /contents` で取得し、tree-sitter でパースして関数、呼び出し、import を抽出する
+3. 呼び出しを import 情報と突き合わせてコールグラフ（JSON）を組み立て、`owner/repo#pr@headSha` キーで service worker のメモリにキャッシュする
+4. あわせて各ファイルの patch から「コメント可能な行集合」を作り、関数の行範囲と突き合わせて行レベルのコメント可否を判定する
+5. content script がグラフを mermaid 記法に変換して描画する
+6. レビュー投稿は `POST /pulls/{n}/reviews` に全下書きを載せ、1 回の API 呼び出しで行う
+
+言語ごとの処理（抽出クエリ、import 解決、呼び出し解決）は `src/background/languages/` の `LanguageDefinition` にカプセル化してある。
+言語の追加は、定義を 1 つ書いて登録簿に足し、文法 wasm をビルドに含めるだけでよい。
+
+## 開発者向け
+
+### ビルド
 
 ```sh
 npm ci --include=dev   # NODE_ENV=production な環境でも devDependencies を入れる
-npm run build          # typecheck + バンドル + manifest / wasm コピー → dist/
+npm run build          # typecheck + esbuild バンドル + manifest / wasm コピー → dist/
 ```
 
-`dist/` を `chrome://extensions` の「パッケージ化されていない拡張機能を読み込む」で読み込む。
+mermaid（約 3.3MB）は `dist/mermaid-view.js` に分離し、初回描画時に動的 import する（content script 本体は約 23KB）。
+manifest の CSP には tree-sitter WASM の実行に必須の `wasm-unsafe-eval` を指定している。
 
 ### ユニットテスト
 
-tree-sitter の解析コア（`src/background/analyzer-core.ts` + `languages/`）と
-diff 行マッピング（`src/background/diff-lines.ts`）は GitHub API に依存しないため、
-`test/fixtures/`（TS）・`test/fixtures-go/`（Go）・`test/fixtures-py/`（Python）の
-小さなプロジェクトや patch 文字列に対して Node 上で検証する（レート制限を消費しない）:
+解析コア（`analyzer-core.ts` と `languages/`）、diff 行マッピング（`diff-lines.ts`）、mermaid 記法変換（`mermaid-source.ts`）、下書きキュー（`review-drafts.ts`）は GitHub API に依存しない純粋ロジックとして分離してあり、`test/fixtures*/` の小さなプロジェクトに対して Node 上で検証する（レート制限を消費しない）。
 
 ```sh
 npm test               # esbuild でコアをバンドル → node --test
 ```
 
-### 自動動作確認 (E2E)
+### 自動動作確認（E2E）
 
-branded Chrome 137+ は `--load-extension` を無視するため、Playwright の Chromium
-（open-source ビルド）に拡張をロードして実 PR ページで確認する:
+branded Chrome 137+ は `--load-extension` を無視するため、Playwright の Chromium（open-source ビルド）に拡張をロードして実 PR ページで確認する。
 
 ```sh
 npx playwright install chromium
 npm run e2e -- --repo honojs/hono --pr 5140
-# 実 PR ページでボタン注入 / mermaid グラフ描画（色分け・凡例）/ ノードクリック → 詳細 /
-# フィルタトグル / SW キャッシュ / options の PAT 保存・削除 / SPA 遷移 /
-# 下書きキュー（追加・編集・削除・開き直し / リロード後の復元）/
-# まとめて送信（未認証で無効 + PAT 導線、pat_required、無効 PAT での 401 + 下書き保持）を確認
-# ※ 実 PR へのレビュー投稿は行わない（無効 PAT の 401 経路までを自動確認する）
 ```
 
-E2E は未認証レート制限（60 req/h、IP 単位）を消費する。`--pr` で対応言語のファイルを
-含む小さめの PR を指定するとリクエスト数を抑えられる（未指定なら PR 一覧の先頭を使う）。
-Go / Python の例: `--repo gorilla/mux --pr 760`（Go、約 15 リクエスト）/
-`--repo pallets/flask --pr 6013`（Python、依存 fetch 上限まで使い約 45 リクエスト）。
+ボタン注入、グラフ描画と色分け、ノードクリック、フィルタ、options の PAT 保存と削除、SPA 遷移への追従、下書きキューの操作と復元、まとめて送信のエラー経路までを自動確認する。
+実 PR へのレビュー投稿は行わない（無効 PAT での 401 経路までを確認する）。
 
-## 設定 (PAT)
+E2E は未認証レート制限（60 req/h、IP 単位）を消費する。
+`--repo gorilla/mux --pr 760`（Go、約 15 リクエスト）や `--repo pallets/flask --pr 6013`（Python、約 45 リクエスト）のように、対応言語のファイルを含む小さめの PR を指定するとよい。
 
-拡張の options ページ（`chrome://extensions` → 詳細 → 拡張機能のオプション、
-またはパネル内「PAT を設定する」）で GitHub Personal Access Token を設定できる。
-
-- 未設定でも公開リポジトリなら動く（未認証モード。レート制限 60 req/h、コメント投稿は不可）
-- PAT は `chrome.storage.local` にのみ保存
-- 権限: 閲覧だけなら fine-grained PAT の `Contents` / `Pull requests` Read で十分。
-  レビューコメントを投稿するには `Pull requests` の **Read and write**
-  （classic PAT なら `repo` スコープ、公開リポジトリのみなら `public_repo`）が必要
-
-## 構成
+### ディレクトリ構成
 
 ```
-manifest.json            # MV3。CSP に wasm-unsafe-eval（tree-sitter WASM に必須）
+manifest.json            # MV3。CSP に wasm-unsafe-eval
 src/
 ├── content/             # content script（github.com/* に注入、PR ページ判定はコード側）
 │   ├── index.ts         # エントリポイント
 │   ├── detector.ts      # PR ページ検出（turbo / popstate / ポーリングで SPA 遷移に追従）
-│   ├── panel.ts         # トグルボタン注入 + Shadow DOM パネル（グラフ + 詳細サイドペインの 2 ペイン）
-│   ├── mermaid-source.ts# グラフ JSON → mermaid 記法変換 + 表示フィルタ（純粋ロジック、テスト対象）
+│   ├── panel.ts         # トグルボタン注入 + Shadow DOM パネル（グラフ + 詳細サイドペイン）
+│   ├── mermaid-source.ts# グラフ JSON → mermaid 記法変換 + 表示フィルタ（純粋ロジック）
 │   └── mermaid-view.ts  # GraphRenderer インターフェース + mermaid 実装（別バンドルで遅延ロード）
 ├── background/
 │   ├── sw.ts            # service worker（メッセージハンドラ）
-│   ├── github-api.ts    # GitHub REST API クライアント（pulls / files / contents / ディレクトリ一覧 / コメント投稿）
-│   ├── analyzer-core.ts # コールグラフ組み立ての言語非依存コア（環境非依存。テストはこれを直接検証）
-│   ├── languages/       # 言語定義（抽出クエリ・import 解決・呼び出し解決を言語ごとにカプセル化）
-│   │   ├── types.ts     # LanguageDefinition インターフェース + 共通ヘルパ
-│   │   ├── typescript.ts / go.ts / python.ts
-│   │   └── index.ts     # 登録簿（言語追加はここに 1 つ足す）
-│   ├── diff-lines.ts    # patch → コメント可能行集合（RIGHT サイド）の純粋ロジック（テスト対象）
-│   └── analyzer.ts      # SW 統合: GitHub API 配線 + headSha キーのメモリキャッシュ
-├── options/             # PAT の設定ページ（保存・削除・接続テスト）+ 対応言語の一覧表示
-└── shared/
-    ├── messages.ts      # content / options ⇔ background のメッセージ型定義
-    ├── github.ts        # GitHub API の共有型 + エラーの日本語化
-    ├── graph.ts         # コールグラフの共有型（ノード / エッジ / スキップ情報）
-    ├── languages.ts     # 対応言語のメタデータ（id / 表示名 / 拡張子）
-    ├── review-drafts.ts # レビュー下書きキューの純粋ロジック（upsert / 削除 / 検証 / Reviews API ボディ組み立て。テスト対象）
-    └── settings.ts      # PAT の chrome.storage.local 読み書き
-test/                    # analyzer-core（TS/Go/Python）/ diff-lines / mermaid-source / review-drafts のテスト + fixtures*/
+│   ├── github-api.ts    # GitHub REST API クライアント
+│   ├── analyzer-core.ts # コールグラフ組み立ての言語非依存コア
+│   ├── languages/       # 言語定義（typescript / go / python。追加は index.ts の登録簿へ）
+│   ├── diff-lines.ts    # patch → コメント可能行集合の純粋ロジック
+│   └── analyzer.ts      # SW 統合（GitHub API 配線 + headSha キーのメモリキャッシュ）
+├── options/             # PAT の設定ページ + 対応言語の一覧表示
+└── shared/              # メッセージ型、グラフ型、下書きキュー、設定などの共有コード
+test/                    # 上記純粋ロジックのテスト + fixtures*/（TS / Go / Python の小プロジェクト）
 scripts/e2e.mjs          # Playwright Chromium での自動動作確認
-wasm/ (dist 内)          # web-tree-sitter + tree-sitter-{typescript,tsx,go,python} の wasm（ビルド時にコピー）
 ```
-
-## コールグラフ解析（Phase 3 時点、Phase 6 で多言語化）
-
-- 抽出: 関数宣言 / アロー関数・関数式（変数代入）/ クラスメソッドと、本体内の呼び出し・import
-- 解決: 同一ファイル / 相対 import（named・alias・namespace・default）/ `this.method()` / 自己再帰
-- 依存は深さ 1 まで contents API で取得（`DEFAULT_DEPENDENCY_DEPTH`）。外部パッケージはノード化しない
-- 解析結果は SW メモリに `owner/repo#pr@headSha` キーでキャッシュ（レート制限保護）
-
-## 多言語対応（Phase 6 時点）
-
-言語ごとの処理は `src/background/languages/` の `LanguageDefinition` にカプセル化されており、
-言語追加は「定義を 1 つ書いて登録簿に足す + wasm を copy-wasm / analyzer.ts に足す」だけでよい。
-
-| 言語 | 拡張子 | 抽出 | import / 呼び出し解決 |
-|---|---|---|---|
-| TypeScript / JavaScript | .ts .tsx .js .jsx .mjs .cjs | 関数宣言 / アロー / メソッド | 相対 import（named / alias / namespace / default）、`this.method()` |
-| Go | .go | 関数 / メソッド（表示名 `Receiver.Method`） | 同一パッケージ（= ディレクトリ。兄弟ファイルを自動展開）、go.mod の module パス基準のパッケージ import、`x.Method()` はパッケージ内で一意なときのみ |
-| Python | .py | 関数 / ネスト関数 / メソッド（表示名 `Class.method`、デコレータ含む範囲） | 相対 import（`.` / `..`）、絶対 import（リポジトリルート + src レイアウト推定、標準ライブラリは除外）、`self.method()` |
-
-- Go の「ディレクトリ = パッケージ」解決のため、contents API のディレクトリ一覧
-  （`listDirectory`）を使う。go.mod がリポジトリルートにない場合（モノレポ等）は
-  パッケージ間解決を諦め、同一パッケージ内のみ解決する
-- 行レベルのコメント可否判定・投稿 UI は言語非依存（patch と行範囲しか見ない）
-
-## グラフ表示（Phase 4 時点）
-
-- パネルはグラフ表示エリア + サイドペイン（関数詳細）の 2 ペイン。右下ハンドルでリサイズ可能
-- mermaid（flowchart LR）で描画。行レベルのコメント可否で 3 区分に色分け（凡例つき）:
-  コメント可 = 緑・実線 / 変更ファイル内だが関数無変更 = 黄 / diff 外の依存先 = グレー・破線
-- フィルタトグル: 「エッジのあるノードのみ」（デフォルト ON。孤立ノードを隠す）/「変更ファイル内のみ」
-- ノードクリックでサイドペインに関数名 / パス:行範囲 / ソース全文 / コメント欄を表示
-- mermaid（約 3.3MB）は `dist/mermaid-view.js` に分離し、初回描画時に動的 import
-  （content.js 本体は約 23KB のまま）。レンダラーは `GraphRenderer` インターフェースで
-  差し替え可能（将来の Cytoscape.js 移行口）
-
-## レビューコメント（Phase 5 で行マッピング、batch-review-comments でまとめて送信化）
-
-- `GET /pulls/{n}/files` の patch をパースし、**RIGHT サイド（head）でコメント可能な
-  行番号集合**（追加行 + 文脈行）を作成（`diff-lines.ts`）。関数の行範囲と突き合わせて
-  各ノードに `commentableLines` / `commentLine`（推奨行 = 範囲内の最初の追加行、
-  なければ最初の文脈行）を載せる
-- コメント可能ノードは対象行を表示（複数候補があれば select で選択可）し、
-  「**下書きに追加**」でパネル内のキューに溜める（この時点では送信されない）。
-  同一ノードの下書きは編集・削除でき、下書きのあるノードはグラフ上にオレンジ枠でマークされる
-- パネル下部の**下書き一覧**（件数バッジ / ノード名 / path:line / 本文プレビュー / 編集・削除）から
-  「**n 件の下書きをまとめて送信**」で `POST /repos/{owner}/{repo}/pulls/{n}/reviews`
-  （`commit_id` = 解析に使った headSha、`event: 'COMMENT'`、`comments[]` は `side: 'RIGHT'`）に
-  **1 回の API 呼び出しで 1 つのレビューとして投稿**する。成功時は `html_url` へのリンクを表示
-- 失敗時（422 で特定行が invalid 等）はエラーを人間可読で表示し、**下書きは消さない**
-  （修正して再送できる）。単発投稿の `POST_REVIEW_COMMENT` も background には残っている（UI 未使用）
-- 下書きキューは `chrome.storage.session` に `reviewDrafts:owner/repo#pr` キーで退避され、
-  SPA 遷移・パネルの開き直し・ページリロードでも消えない（PR ごとに別キュー。
-  content から session 領域を使うため SW 起動時に `setAccessLevel` で開放している）
-- 投稿不可の理由を UI に明示: diff 外 / 変更ファイル内だが関数無変更。送信ボタンは
-  PAT 未設定なら無効 + 「PAT を設定する」導線（保存すると `storage.onChanged` で自動活性化）。
-  下書きの**追加自体は PAT 不要**（必要なのは送信時だけ）
-- PAT 未設定時は background 側でも `pat_required` の型付きエラーで拒否（二重防御）
