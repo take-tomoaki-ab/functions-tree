@@ -1,0 +1,53 @@
+# PR テンプレートのルールを機械的に強制するチェック。
+# リポジトリオーナー以外が出した PR は、本文に動作確認のスクリーンショット
+# または動画（画像 markdown / <img> / GitHub のアップロード URL / 動画 URL）が
+# 含まれていないと fail する。本文を編集すれば再実行される。
+name: Require screenshot for external PRs
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR body for screenshot or video
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+
+            // リポジトリオーナー本人と bot（dependabot 等）は対象外
+            if (author === context.repo.owner || pr.user.type === 'Bot') {
+              core.info(`skip: author=${author} is exempt`);
+              return;
+            }
+
+            const body = pr.body ?? '';
+            const patterns = [
+              /!\[[^\]]*\]\([^)]+\)/,                              // markdown 画像
+              /<img[\s>]/i,                                        // HTML img タグ
+              /https:\/\/github\.com\/user-attachments\/assets\//, // 画像・動画のアップロード URL
+              /https:\/\/user-images\.githubusercontent\.com\//,   // 旧形式のアップロード URL
+              /https?:\/\/\S+\.(png|jpe?g|gif|webp|mp4|mov|webm)\b/i, // 直リンク
+            ];
+
+            if (patterns.some((re) => re.test(body))) {
+              core.info('OK: screenshot or video found in PR body');
+              return;
+            }
+
+            core.setFailed(
+              [
+                `@${author} さん: このリポジトリでは、オーナー以外の方が PR を出す場合、`,
+                '動作確認のスクリーンショットまたは動画を PR 本文に貼り付けることが必須です。',
+                'PR 本文の「動作確認（スクリーンショット / 動画）」セクションに追加してください',
+                '（`npm run e2e` が `screenshots/` に出力する画像でも OK）。',
+                '本文を編集すると、このチェックは自動で再実行されます。',
+              ].join('\n')
+            );
