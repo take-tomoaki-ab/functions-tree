@@ -20,6 +20,16 @@ import { getPat, PAT_KEY } from '../shared/settings';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
 import type { GraphRenderer, RenderHandle } from './mermaid-view';
+import {
+  anchoredScroll,
+  clampZoom,
+  formatZoom,
+  wheelZoom,
+  ZOOM_MAX,
+  ZOOM_MIN,
+  zoomIn,
+  zoomOut,
+} from './zoom';
 
 const BUTTON_ID = 'functions-tree-toggle';
 const PANEL_HOST_ID = 'functions-tree-panel-host';
@@ -195,10 +205,62 @@ const PANEL_CSS = `
 }
 .graph-area {
   flex: 1;
-  overflow: auto;
-  padding: 12px;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
   /* mermaid の SVG はライトテーマ配色で生成するため背景は常に白 */
   background: #ffffff;
+}
+.graph-scroll {
+  height: 100%;
+  box-sizing: border-box;
+  overflow: auto;
+  padding: 12px;
+}
+/* ズームコントロール（グラフ領域右上のオーバーレイ）。グラフ領域は常に白背景なので
+   ダークテーマでもライト配色のままにする */
+.zoom-controls {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #d1d9e0;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(140, 149, 159, 0.25);
+}
+.zoom-button {
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  font-size: 13px;
+  line-height: 1;
+  color: #25292e;
+  background: #f6f8fa;
+  border: 1px solid #d1d9e0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.zoom-button:hover:enabled {
+  background: #eef1f4;
+}
+.zoom-button:disabled {
+  color: #8c959f;
+  cursor: not-allowed;
+}
+.zoom-reset {
+  font-size: 12px;
+}
+.zoom-level {
+  min-width: 40px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: #59636e;
 }
 .graph-empty {
   margin: 0;
@@ -589,6 +651,8 @@ let panelHost: HTMLElement | null = null;
 let statusEl: HTMLElement | null = null;
 let authNoticeEl: HTMLElement | null = null;
 let graphAreaEl: HTMLElement | null = null;
+/** グラフのスクロールコンテナ（.graph-scroll）。レンダラーの描画先はこちら */
+let graphCanvasEl: HTMLElement | null = null;
 let sidePaneEl: HTMLElement | null = null;
 let nodeCountEl: HTMLElement | null = null;
 let draftsListEl: HTMLElement | null = null;
@@ -609,6 +673,11 @@ let currentGraph: FunctionGraph | null = null;
 let currentHeadSha: string | null = null;
 let selectedNode: GraphNode | null = null;
 let renderHandle: RenderHandle | null = null;
+// グラフの表示倍率（1 = 実寸）。フィルタ切り替えの再描画でも維持し、
+// パネルを開き直したら 1 に戻す
+let zoomLevel = 1;
+// ズームコントロールの表示更新関数（倍率表示・ボタン活性）。パネル構築時に差し込む
+let zoomUiUpdater: (() => void) | null = null;
 // PAT が設定されているか（コメント投稿ボタンの活性条件）。
 // パネルを開いたときに読み、storage.onChanged で追従する
 // （パネルの「PAT を設定する」から options で保存 → 戻るとボタンが自動で活きる）
@@ -814,6 +883,69 @@ function createToggle(
   return label;
 }
 
+/**
+ * 表示倍率を変更し、SVG のサイズとスクロール位置・コントロール表示へ反映する。
+ * anchor は .graph-scroll のビューポート内座標で、その真下のコンテンツが
+ * ズーム後も動かないようスクロールを合わせる（省略時はビューポート中央）。
+ */
+function setZoomLevel(next: number, anchor?: { x: number; y: number }): void {
+  const clamped = clampZoom(next);
+  const prev = zoomLevel;
+  zoomLevel = clamped;
+  zoomUiUpdater?.();
+  if (!graphCanvasEl || !renderHandle || clamped === prev) return;
+  renderHandle.setZoom(clamped);
+  const ratio = clamped / prev;
+  const a = anchor ?? {
+    x: graphCanvasEl.clientWidth / 2,
+    y: graphCanvasEl.clientHeight / 2,
+  };
+  graphCanvasEl.scrollLeft = anchoredScroll(graphCanvasEl.scrollLeft, a.x, ratio);
+  graphCanvasEl.scrollTop = anchoredScroll(graphCanvasEl.scrollTop, a.y, ratio);
+}
+
+/** グラフ領域右上のズームコントロール（− / 倍率 / ＋ / リセット）を組み立てる */
+function buildZoomControls(): HTMLElement {
+  const controls = document.createElement('div');
+  controls.className = 'zoom-controls';
+  controls.title = 'Ctrl/Cmd + ホイールでもズームできます';
+
+  const out = document.createElement('button');
+  out.className = 'zoom-button zoom-out';
+  out.type = 'button';
+  out.textContent = '−';
+  out.setAttribute('aria-label', 'ズームアウト');
+  out.addEventListener('click', () => setZoomLevel(zoomOut(zoomLevel)));
+
+  const level = document.createElement('span');
+  level.className = 'zoom-level';
+
+  const zin = document.createElement('button');
+  zin.className = 'zoom-button zoom-in';
+  zin.type = 'button';
+  zin.textContent = '＋';
+  zin.setAttribute('aria-label', 'ズームイン');
+  zin.addEventListener('click', () => setZoomLevel(zoomIn(zoomLevel)));
+
+  const reset = document.createElement('button');
+  reset.className = 'zoom-button zoom-reset';
+  reset.type = 'button';
+  reset.textContent = 'リセット';
+  reset.setAttribute('aria-label', '倍率をリセット');
+  reset.addEventListener('click', () => setZoomLevel(1));
+
+  zoomUiUpdater = (): void => {
+    level.textContent = formatZoom(zoomLevel);
+    zin.disabled = zoomLevel >= ZOOM_MAX;
+    out.disabled = zoomLevel <= ZOOM_MIN;
+    reset.disabled = zoomLevel === 1;
+  };
+  zoomUiUpdater();
+
+  controls.append(out, level, zin, reset);
+  return controls;
+}
+
 function createLegendItem(chipClass: string, text: string): HTMLElement {
   const item = document.createElement('span');
   item.className = 'legend-item';
@@ -903,6 +1035,26 @@ function buildPanel(): HTMLElement {
   main.className = 'main';
   graphAreaEl = document.createElement('div');
   graphAreaEl.className = 'graph-area';
+  graphCanvasEl = document.createElement('div');
+  graphCanvasEl.className = 'graph-scroll';
+  // Ctrl/Cmd + ホイールでカーソル位置を基準にズーム（トラックパッドのピンチも
+  // Chrome は ctrlKey 付き wheel として通知するのでそのまま効く）。
+  // 修飾キーなしのホイールは通常のスクロールとして素通しする
+  graphCanvasEl.addEventListener(
+    'wheel',
+    (e) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      if (!graphCanvasEl) return;
+      const rect = graphCanvasEl.getBoundingClientRect();
+      setZoomLevel(wheelZoom(zoomLevel, e.deltaY), {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      });
+    },
+    { passive: false }
+  );
+  graphAreaEl.append(graphCanvasEl, buildZoomControls());
   sidePaneEl = document.createElement('div');
   sidePaneEl.className = 'side-pane';
   main.append(graphAreaEl, sidePaneEl);
@@ -1305,7 +1457,7 @@ function selectNode(node: GraphNode | null): void {
 
 /** 現在のグラフ + フィルタ状態で mermaid を描画し直す */
 async function renderGraph(): Promise<void> {
-  if (!currentGraph || !graphAreaEl || !nodeCountEl) return;
+  if (!currentGraph || !graphCanvasEl || !nodeCountEl) return;
   const token = ++renderToken;
   const filtered = filterGraph(currentGraph, graphFilter);
   nodeCountEl.textContent = `表示 ${filtered.nodes.length} / 全 ${currentGraph.nodes.length} ノード`;
@@ -1318,12 +1470,12 @@ async function renderGraph(): Promise<void> {
     const empty = document.createElement('p');
     empty.className = 'graph-empty';
     empty.textContent = '表示できるノードがありません（フィルタを緩めてください）。';
-    graphAreaEl.replaceChildren(empty);
+    graphCanvasEl.replaceChildren(empty);
     return;
   }
   try {
     const renderer = await getRenderer();
-    const handle = await renderer.render(graphAreaEl, filtered, {
+    const handle = await renderer.render(graphCanvasEl, filtered, {
       onNodeClick: selectNode,
     });
     // 描画中にパネルが閉じられた / 別の描画が始まっていたら反映しない
@@ -1331,6 +1483,8 @@ async function renderGraph(): Promise<void> {
     renderHandle = handle;
     if (selectedNode) handle.setSelected(selectedNode.id);
     handle.setDraftMarks(new Set(drafts.map((d) => d.nodeId)));
+    // フィルタ切り替え等の再描画でも現在の倍率を維持する
+    handle.setZoom(zoomLevel);
   } catch (e) {
     if (token !== renderToken || !statusEl) return;
     statusEl.dataset.state = 'error';
@@ -1371,12 +1525,13 @@ async function loadGraph(pr: PrRef): Promise<void> {
 
 function openPanel(): void {
   if (panelHost || !currentPr) return;
-  // パネルを開くたびにフィルタ・選択状態は初期値に戻す
+  // パネルを開くたびにフィルタ・選択状態・倍率は初期値に戻す
   graphFilter = { connectedOnly: true, inDiffOnly: false };
   selectedNode = null;
   currentGraph = null;
   currentHeadSha = null;
   renderHandle = null;
+  zoomLevel = 1;
   drafts = [];
   submitting = false;
   // まとめて送信ボタンの活性条件。以後の変更は storage.onChanged が追従する
@@ -1418,6 +1573,7 @@ function closePanel(): void {
   statusEl = null;
   authNoticeEl = null;
   graphAreaEl = null;
+  graphCanvasEl = null;
   sidePaneEl = null;
   nodeCountEl = null;
   draftsListEl = null;
@@ -1429,6 +1585,8 @@ function closePanel(): void {
   currentHeadSha = null;
   selectedNode = null;
   renderHandle = null;
+  zoomLevel = 1;
+  zoomUiUpdater = null;
   commentUiUpdater = null;
   // drafts は chrome.storage.session に退避済み。次に開いたとき復元される
   drafts = [];

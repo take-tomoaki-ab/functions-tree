@@ -33,6 +33,12 @@
 // feat/syntax-highlight で追加した確認項目:
 // - ノード詳細のソースがシンタックスハイライトされる（.source code 内に tok-* の span）
 //
+// feat/mermaid-zoom で追加した確認項目:
+// - グラフ領域右上のズームコントロール（＋ / − / リセット / 倍率表示）で
+//   SVG の width/height が倍率どおりに変わる（viewBox は据え置き）
+// - Ctrl/Cmd + ホイールでもズームできる（カーソル位置基準）
+// - リセットで 100%（基準サイズ）に戻る
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -260,6 +266,76 @@ try {
   });
   record('panel: anonymous-mode notice shown', authNoticeVisible);
   await shot(page, '3-panel-mermaid-graph');
+
+  // 4b. ズームコントロール: ＋/− で SVG サイズが倍率どおりに変わり、リセットで戻ること。
+  //     viewBox は据え置き（width/height 属性だけで拡縮する実装）であることも確認する
+  const readZoom = () =>
+    page.evaluate(() => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      const svg = shadow?.querySelector('.graph-area svg');
+      return {
+        width: svg ? Number(svg.getAttribute('width')) : 0,
+        height: svg ? Number(svg.getAttribute('height')) : 0,
+        viewBox: svg?.getAttribute('viewBox') ?? '',
+        label: (shadow?.querySelector('.zoom-level')?.textContent ?? '').trim(),
+        resetDisabled: shadow?.querySelector('.zoom-reset')?.disabled ?? null,
+      };
+    });
+  const zoomBase = await readZoom();
+  record(
+    'zoom: starts at 100% (reset disabled)',
+    zoomBase.label === '100%' && zoomBase.resetDisabled === true && zoomBase.width > 0,
+    `label=${zoomBase.label} width=${zoomBase.width}`
+  );
+  await page.locator('#functions-tree-panel-host .zoom-in').click();
+  const zoomedIn = await readZoom();
+  record(
+    'zoom: + button enlarges svg to 125% (viewBox unchanged)',
+    Math.abs(zoomedIn.width - zoomBase.width * 1.25) < 0.5 &&
+      zoomedIn.label === '125%' && zoomedIn.viewBox === zoomBase.viewBox,
+    `width=${zoomBase.width} -> ${zoomedIn.width} label=${zoomedIn.label}`
+  );
+  await shot(page, '3b-zoom-in-125');
+  await page.locator('#functions-tree-panel-host .zoom-out').click();
+  await page.locator('#functions-tree-panel-host .zoom-out').click();
+  const zoomedOut = await readZoom();
+  record(
+    'zoom: − button shrinks svg to 80%',
+    Math.abs(zoomedOut.width - zoomBase.width * 0.8) < 0.5 && zoomedOut.label === '80%',
+    `width=${zoomedOut.width} label=${zoomedOut.label}`
+  );
+  // Ctrl/Cmd + ホイール（上スクロール = 拡大）。実イベントと同じ合成 WheelEvent を
+  // .graph-scroll に流す（Playwright の mouse.wheel は修飾キーを載せられないため）
+  await page.evaluate(() => {
+    const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+    const scroll = shadow?.querySelector('.graph-scroll');
+    const r = scroll.getBoundingClientRect();
+    scroll.dispatchEvent(
+      new WheelEvent('wheel', {
+        deltaY: -120,
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+        clientX: r.left + r.width / 2,
+        clientY: r.top + r.height / 2,
+      })
+    );
+  });
+  const zoomedWheel = await readZoom();
+  record(
+    'zoom: ctrl+wheel up enlarges svg',
+    zoomedWheel.width > zoomedOut.width && zoomedWheel.label !== zoomedOut.label,
+    `width=${zoomedOut.width} -> ${zoomedWheel.width} label=${zoomedWheel.label}`
+  );
+  await page.locator('#functions-tree-panel-host .zoom-reset').click();
+  const zoomedReset = await readZoom();
+  record(
+    'zoom: reset returns to 100% (base size)',
+    zoomedReset.width === zoomBase.width && zoomedReset.label === '100%' &&
+      zoomedReset.resetDisabled === true,
+    `width=${zoomedReset.width} label=${zoomedReset.label}`
+  );
+  await shot(page, '3c-zoom-reset');
 
   // 5. ノードクリックでサイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）が出ること
   const readDetail = () =>
