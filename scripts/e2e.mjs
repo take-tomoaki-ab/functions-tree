@@ -33,6 +33,8 @@
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
+// スクリーンショットはデフォルトで screenshots/ に出力する（--out で変更可）。
+//
 // usage: node scripts/e2e.mjs [--repo owner/name] [--pr number] [--out screenshot-dir]
 
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
@@ -48,7 +50,7 @@ const argOf = (name, fallback) => {
 };
 const repo = argOf('--repo', 'microsoft/TypeScript');
 const prNumber = argOf('--pr', null);
-const outDir = argOf('--out', 'e2e-results');
+const outDir = argOf('--out', 'screenshots');
 const distPath = fileURLToPath(new URL('../dist', import.meta.url));
 
 mkdirSync(outDir, { recursive: true });
