@@ -113,6 +113,78 @@ try {
   record('PR page: button injected', true, prHref);
   await shot(page, '2-pr-page-button');
 
+  // 3b. スクロールでヘッダーが画面外に出てもボタンが押せる位置に残ること（fixed 追従）。
+  //     未ログイン（headless e2e）ではヘッダーのアクション領域が d-none のため、
+  //     ボタンは最初からフォールバックの fixed 表示になる。その場合は
+  //     「スクロールしても viewport 内に見えている」ことだけを確認し、
+  //     アンカーが可視のとき（ログイン時相当）のみ inline ⇔ fixed の遷移も確認する
+  //     （遷移そのものの決定的な検証は、アンカー可視の偽 PR ページを route で
+  //     差し込む方式で実装時に確認済み）。
+  const buttonMode = await page.evaluate(() => {
+    const b = document.getElementById('functions-tree-toggle');
+    return b?.parentElement === document.body ? 'fallback-fixed' : 'anchored';
+  });
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  await page
+    .waitForFunction(
+      () => {
+        const b = document.getElementById('functions-tree-toggle');
+        return !!b && getComputedStyle(b).position === 'fixed';
+      },
+      undefined,
+      { timeout: 5_000 }
+    )
+    .catch(() => {});
+  const floatedStyle = await page.evaluate(() => {
+    const b = document.getElementById('functions-tree-toggle');
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return {
+      position: getComputedStyle(b).position,
+      inViewport: r.top >= 0 && r.bottom <= innerHeight && r.width > 0,
+      // Files changed タブ等では sticky ツールバーの Submit ボタンの左に移動する
+      dockedBySubmit:
+        b.nextElementSibling instanceof HTMLElement &&
+        /ReviewMenuButton/.test(b.nextElementSibling.className),
+    };
+  });
+  record(
+    `scroll: button stays reachable when header scrolled out [${buttonMode}]`,
+    (floatedStyle?.position === 'fixed' || floatedStyle?.dockedBySubmit === true) &&
+      floatedStyle.inViewport,
+    JSON.stringify(floatedStyle)
+  );
+  await shot(page, '2b-button-floating-on-scroll');
+  await page.evaluate(() => window.scrollTo(0, 0));
+  if (buttonMode === 'anchored') {
+    await page
+      .waitForFunction(
+        () => {
+          const b = document.getElementById('functions-tree-toggle');
+          return !!b && getComputedStyle(b).position !== 'fixed';
+        },
+        undefined,
+        { timeout: 5_000 }
+      )
+      .catch(() => {});
+  }
+  const topStyle = await page.evaluate(() => {
+    const b = document.getElementById('functions-tree-toggle');
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return {
+      position: getComputedStyle(b).position,
+      inViewport: r.top >= 0 && r.bottom <= innerHeight && r.width > 0,
+    };
+  });
+  record(
+    'scroll: button visible again at top (inline when anchored)',
+    buttonMode === 'anchored'
+      ? topStyle?.position !== 'fixed' && topStyle?.inViewport === true
+      : topStyle?.position === 'fixed' && topStyle?.inViewport === true,
+    `mode=${buttonMode} ${JSON.stringify(topStyle)}`
+  );
+
   // 4. ボタン押下でパネルが開き、コールグラフのサマリと mermaid の SVG が描画されること
   const waitForGraphStatus = () =>
     page.waitForFunction(
@@ -366,6 +438,14 @@ try {
   await page.locator(BUTTON).click();
   const panelCount = await page.locator('#functions-tree-panel-host').count();
   record('panel: toggle closes panel', panelCount === 0, `count=${panelCount}`);
+
+  // 8b. Esc キーでもパネルが閉じること（SW キャッシュから開き直して確認）
+  await page.locator(BUTTON).click();
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  await page.keyboard.press('Escape');
+  const panelAfterEsc = await page.locator('#functions-tree-panel-host').count();
+  record('panel: Escape closes panel', panelAfterEsc === 0, `count=${panelAfterEsc}`);
 
   // 9. SPA 遷移で PR ページを離れるとボタンが消えること（戻る = popstate）
   await page.goBack({ waitUntil: 'domcontentloaded' });
@@ -754,6 +834,33 @@ try {
       `activeElement=${panelKey.activeTag} "${panelKey.activeHint}"`
   );
   await shot(page, '19-files-tab-t-in-panel');
+
+  // 20. textarea 入力中の Esc はフォーカス解除のみ（パネルは開いたまま・本文は残る）、
+  //     もう一度 Esc でパネルが閉じること
+  await page.keyboard.press('Escape');
+  const afterFirstEsc = await page.evaluate(() => {
+    const host = document.querySelector('#functions-tree-panel-host');
+    const active = host?.shadowRoot?.activeElement;
+    return {
+      panelOpen: !!host,
+      value: host?.shadowRoot?.querySelector('.comment-input')?.value ?? '',
+      textareaFocused: active?.classList?.contains('comment-input') ?? false,
+    };
+  });
+  record(
+    'escape: first Esc in textarea only blurs (panel stays, draft body kept)',
+    afterFirstEsc.panelOpen && afterFirstEsc.value === 't' && !afterFirstEsc.textareaFocused,
+    `panelOpen=${afterFirstEsc.panelOpen} value="${afterFirstEsc.value}" ` +
+      `textareaFocused=${afterFirstEsc.textareaFocused}`
+  );
+  await page.keyboard.press('Escape');
+  const panelAfterSecondEsc = await page.locator('#functions-tree-panel-host').count();
+  record(
+    'escape: second Esc closes panel',
+    panelAfterSecondEsc === 0,
+    `count=${panelAfterSecondEsc}`
+  );
+  await shot(page, '20-escape-blur-then-close');
 } catch (e) {
   record('e2e run', false, e.message);
 } finally {

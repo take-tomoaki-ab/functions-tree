@@ -606,6 +606,40 @@ chrome.storage.onChanged.addListener((changes, area) => {
   commentUiUpdater?.();
   renderDrafts(); // まとめて送信ボタンの活性・PAT 導線も追従させる
 });
+/**
+ * パネル表示中の Esc キー処理。document の capture で拾う
+ * （パネル host は GitHub ショートカット誤発動対策で keydown の伝播を止めるため、
+ * バブリングでは document に届かない。capture なら host より先に受け取れる）。
+ * - パネル内のコメント入力中（textarea フォーカス中）の Esc はフォーカス解除に留め、
+ *   書きかけの本文を閉じ損ないで失わないようにする（もう一度 Esc で閉じる）
+ * - パネル外の入力欄（GitHub のファイル検索等）にフォーカスがあるときは
+ *   GitHub 側の Esc 動作（検索を閉じる等）を優先し、パネルは閉じない
+ */
+function handleEscapeKeydown(e: KeyboardEvent): void {
+  if (e.key !== 'Escape' || !panelHost) return;
+  if (e.composedPath().includes(panelHost)) {
+    const active = panelHost.shadowRoot?.activeElement;
+    if (active instanceof HTMLTextAreaElement) {
+      active.blur();
+    } else {
+      closePanel();
+    }
+    e.stopPropagation();
+    return;
+  }
+  const active = document.activeElement;
+  if (
+    active instanceof HTMLInputElement ||
+    active instanceof HTMLTextAreaElement ||
+    active instanceof HTMLSelectElement ||
+    (active instanceof HTMLElement && active.isContentEditable)
+  ) {
+    return;
+  }
+  closePanel();
+  e.stopPropagation();
+}
+
 // フィルタ初期値: 孤立ノード（エッジなし）が多いグラフでも見やすいよう、
 // 「エッジのあるノードのみ」をデフォルト ON にする
 let graphFilter: GraphFilter = { connectedOnly: true, inDiffOnly: false };
@@ -654,6 +688,64 @@ const BUTTON_STYLE =
   'background:var(--button-default-bgColor-rest, #f6f8fa);' +
   'color:var(--button-default-fgColor-rest, #25292e);';
 
+// ヘッダーが画面外にスクロールしたときの浮遊表示（sticky ツールバーに Submit
+// ボタンが見つからないときのフォールバック）。GitHub の sticky ヘッダー
+// （PR タイトルバー、高さ約 60px）の下に重ならない位置
+const FLOATING_BUTTON_STYLE =
+  'position:fixed;top:64px;right:16px;z-index:2147483646;' +
+  'box-shadow:0 3px 8px rgba(31, 35, 40, 0.25);';
+
+// sticky ツールバー内に並べるときのサイズ調整（Submit ボタンは data-size="small"）
+const STICKY_TOOLBAR_BUTTON_STYLE = 'height:28px;font-size:12px;margin-right:8px;';
+
+/**
+ * Files changed タブの sticky ツールバーにある「Submit review / comments」
+ * ボタンを探す。スクロール追従時はこのボタンの左に並べる。
+ */
+function findStickySubmitButton(): HTMLElement | null {
+  for (const el of document.querySelectorAll<HTMLElement>('button[class*="ReviewMenuButton"]')) {
+    if (isVisible(el)) return el;
+  }
+  return null;
+}
+
+/**
+ * 浮遊表示の切り替え。追従時は sticky ツールバーの Submit ボタンの左へ移動し、
+ * Submit ボタンがないタブ（Conversation 等）では右上に fixed で浮かせる。
+ * ヘッダーが見える位置に戻ったら元のアンカーへ戻す。
+ */
+function applyFloating(button: HTMLButtonElement, anchor: HTMLElement, floated: boolean): void {
+  if (!floated) {
+    button.style.cssText = BUTTON_STYLE;
+    if (button.parentElement !== anchor) anchor.prepend(button);
+    return;
+  }
+  const submit = findStickySubmitButton();
+  if (submit?.parentElement) {
+    button.style.cssText = BUTTON_STYLE + STICKY_TOOLBAR_BUTTON_STYLE;
+    submit.parentElement.insertBefore(button, submit);
+  } else {
+    button.style.cssText = BUTTON_STYLE + FLOATING_BUTTON_STYLE;
+  }
+}
+
+// ボタン注入先アンカーの可視監視（スクロール追従用）。再注入のたびに張り替える
+let anchorObserver: IntersectionObserver | null = null;
+
+/**
+ * アンカー（PR ヘッダーのアクション領域）を監視し、上方向へ画面外に出たら
+ * ボタンを浮遊表示に切り替え、ヘッダーが戻ったら元のインライン表示に戻す。
+ */
+function watchAnchorVisibility(button: HTMLButtonElement, anchor: HTMLElement): void {
+  anchorObserver?.disconnect();
+  anchorObserver = new IntersectionObserver((entries) => {
+    const entry = entries[entries.length - 1];
+    const floated = !entry.isIntersecting && entry.boundingClientRect.bottom <= 0;
+    applyFloating(button, anchor, floated);
+  });
+  anchorObserver.observe(anchor);
+}
+
 function createButton(): HTMLButtonElement {
   const button = document.createElement('button');
   button.id = BUTTON_ID;
@@ -676,10 +768,12 @@ function injectButton(): void {
   const anchor = findButtonAnchor();
   if (anchor) {
     anchor.prepend(button);
+    watchAnchorVisibility(button, anchor);
   } else {
     // ヘッダー構造が変わっていても最低限使えるように固定表示で出す
-    button.style.cssText =
-      BUTTON_STYLE + 'position:fixed;top:64px;right:16px;z-index:2147483646;';
+    anchorObserver?.disconnect();
+    anchorObserver = null;
+    button.style.cssText = BUTTON_STYLE + FLOATING_BUTTON_STYLE;
     document.body.appendChild(button);
   }
 }
@@ -741,6 +835,7 @@ function buildPanel(): HTMLElement {
   close.className = 'close-button';
   close.type = 'button';
   close.setAttribute('aria-label', 'パネルを閉じる');
+  close.title = '閉じる（Esc）';
   close.textContent = '✕';
   close.addEventListener('click', closePanel);
   header.append(title, close);
@@ -1271,10 +1366,12 @@ function openPanel(): void {
     panelHost.style.setProperty('--functions-tree-panel-top', `${Math.round(bottom) + 8}px`);
   }
   document.body.appendChild(panelHost);
+  document.addEventListener('keydown', handleEscapeKeydown, true);
   void loadGraph(currentPr);
 }
 
 function closePanel(): void {
+  document.removeEventListener('keydown', handleEscapeKeydown, true);
   panelHost?.remove();
   panelHost = null;
   statusEl = null;
@@ -1315,6 +1412,8 @@ export function mountUi(pr: PrRef): void {
 /** PR ページを離れたとき: ボタンとパネルを除去する */
 export function unmountUi(): void {
   currentPr = null;
+  anchorObserver?.disconnect();
+  anchorObserver = null;
   document.getElementById(BUTTON_ID)?.remove();
   closePanel();
 }
