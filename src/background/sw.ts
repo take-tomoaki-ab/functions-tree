@@ -4,20 +4,16 @@
 import type { PongResponse, RequestMessage } from '../shared/messages';
 import { buildGraphForPr } from './analyzer';
 import {
+  addPendingComment,
+  deletePendingComment,
   getFileContent,
+  getPendingReview,
   getPrFiles,
   getPrInfo,
-  postReviewComment,
-  submitReview,
+  submitPendingReview,
   testAuth,
+  updatePendingComment,
 } from './github-api';
-
-// content script（panel）がレビュー下書きを chrome.storage.session に退避できるようにする。
-// session 領域はデフォルトで trusted context（SW / options）専用のため、明示的に開放が必要。
-// SW 起動のたびに実行される（設定はブラウザセッション内で保持される）。
-void chrome.storage.session.setAccessLevel({
-  accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS',
-});
 
 // MV3 の注意: 非同期に応答する場合は listener から true を返して
 // sendResponse を後から呼ぶ。false を返すと応答チャネルが即座に閉じる。
@@ -52,8 +48,12 @@ chrome.runtime.onMessage.addListener(
         void buildGraphForPr(message.pr).then(sendResponse);
         return true;
       }
-      case 'POST_REVIEW_COMMENT': {
-        void postReviewComment(message.pr, {
+      case 'GET_PENDING_REVIEW': {
+        void getPendingReview(message.pr).then(sendResponse);
+        return true;
+      }
+      case 'ADD_PENDING_COMMENT': {
+        void addPendingComment(message.pr, {
           commitId: message.commitId,
           path: message.path,
           line: message.line,
@@ -61,11 +61,18 @@ chrome.runtime.onMessage.addListener(
         }).then(sendResponse);
         return true;
       }
-      case 'SUBMIT_REVIEW': {
-        void submitReview(message.pr, {
-          commitId: message.commitId,
-          comments: message.comments,
-        }).then(sendResponse);
+      case 'UPDATE_PENDING_COMMENT': {
+        void updatePendingComment(message.pr, message.commentId, message.body).then(
+          sendResponse
+        );
+        return true;
+      }
+      case 'DELETE_PENDING_COMMENT': {
+        void deletePendingComment(message.pr, message.commentId).then(sendResponse);
+        return true;
+      }
+      case 'SUBMIT_PENDING_REVIEW': {
+        void submitPendingReview(message.reviewId).then(sendResponse);
         return true;
       }
       case 'TEST_AUTH': {

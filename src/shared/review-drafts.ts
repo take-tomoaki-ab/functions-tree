@@ -1,115 +1,94 @@
-// レビュー下書きキューの純粋ロジック。
-// content の panel が状態管理・chrome.storage.session への退避に使い、
-// background が SUBMIT_REVIEW のリクエストボディ組み立てに使う。
+// GitHub pending review（ネイティブの下書きレビュー）まわりの純粋ロジック。
+// content の panel が下書きコメントとグラフノードの対応付けに使い、
+// background がリクエストボディの組み立て・API 応答のデシリアライズに使う。
 // chrome API には依存しない（test/review-drafts.test.mjs で Node 上で検証）。
 
-import type { ReviewCommentInput } from './github';
+import type { PendingComment, ReviewCommentInput } from './github';
 
-/** ノード 1 つに対するレビューコメントの下書き（送信するまでローカルに保持） */
-export interface ReviewDraft {
-  /** 対象ノードの GraphNode.id（`path#name@line`）。同一ノードの下書きは 1 つ */
-  nodeId: string;
-  /** 一覧表示用の関数名 */
-  nodeName: string;
+/** ノードとの対応付けに必要な GraphNode のサブセット */
+export interface NodeRef {
+  /** GraphNode.id（`path#name@line`） */
+  id: string;
   /** リポジトリルートからのファイルパス */
-  path: string;
-  /** RIGHT サイドの行番号（1 始まり） */
-  line: number;
-  /** コメント本文（Markdown） */
-  body: string;
-}
-
-/**
- * chrome.storage.session 上のキー。PR ごとに別の下書きキューを持つ
- * （別 PR を開いたときに他 PR の下書きが混ざらない）。
- */
-export function draftStorageKey(pr: { owner: string; repo: string; pr: number }): string {
-  return `reviewDrafts:${pr.owner}/${pr.repo}#${pr.pr}`;
-}
-
-/** 下書きを追加する。同一ノードの下書きがあれば位置を保ったまま置き換える（編集） */
-export function upsertDraft(
-  drafts: readonly ReviewDraft[],
-  draft: ReviewDraft
-): ReviewDraft[] {
-  const index = drafts.findIndex((d) => d.nodeId === draft.nodeId);
-  if (index < 0) return [...drafts, draft];
-  const next = [...drafts];
-  next[index] = draft;
-  return next;
-}
-
-/** 指定ノードの下書きを取り除く（なければそのままのコピーを返す） */
-export function removeDraft(
-  drafts: readonly ReviewDraft[],
-  nodeId: string
-): ReviewDraft[] {
-  return drafts.filter((d) => d.nodeId !== nodeId);
-}
-
-/** 指定ノードの下書きを探す */
-export function findDraft(
-  drafts: readonly ReviewDraft[],
-  nodeId: string
-): ReviewDraft | undefined {
-  return drafts.find((d) => d.nodeId === nodeId);
-}
-
-/**
- * storage から読み戻した値を検証つきでデシリアライズする。
- * 形が想定と違う要素（拡張の旧バージョンが書いた値など）は黙って捨て、
- * 配列でなければ空のキューとして扱う。
- */
-export function parseDrafts(raw: unknown): ReviewDraft[] {
-  if (!Array.isArray(raw)) return [];
-  const drafts: ReviewDraft[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue;
-    const d = item as Record<string, unknown>;
-    if (
-      typeof d.nodeId === 'string' &&
-      d.nodeId.length > 0 &&
-      typeof d.nodeName === 'string' &&
-      typeof d.path === 'string' &&
-      d.path.length > 0 &&
-      typeof d.line === 'number' &&
-      Number.isInteger(d.line) &&
-      d.line >= 1 &&
-      typeof d.body === 'string' &&
-      d.body.trim().length > 0
-    ) {
-      drafts.push({
-        nodeId: d.nodeId,
-        nodeName: d.nodeName,
-        path: d.path,
-        line: d.line,
-        body: d.body,
-      });
-    }
-  }
-  return drafts;
+  filePath: string;
+  /** レビューコメントを付けられる行（patch の RIGHT サイド）。昇順 */
+  commentableLines: readonly number[];
 }
 
 /**
  * POST /repos/{owner}/{repo}/pulls/{n}/reviews のリクエストボディを組み立てる。
- * event: 'COMMENT' で、全コメントが 1 つのレビューとしてまとめて投稿される。
+ * event を省略すると PENDING のレビュー（GitHub ネイティブの下書き）として作られ、
+ * submit するまで PR の相手には見えない。pending review が無いときの
+ * 「最初の 1 件の下書き追加」= このボディでレビューごと作成する。
  */
-export function buildReviewRequestBody(
+export function buildPendingReviewCreateBody(
   commitId: string,
-  comments: readonly ReviewCommentInput[]
+  comment: ReviewCommentInput
 ): {
   commit_id: string;
-  event: 'COMMENT';
   comments: Array<{ path: string; line: number; side: 'RIGHT'; body: string }>;
 } {
   return {
     commit_id: commitId,
-    event: 'COMMENT',
-    comments: comments.map((c) => ({
-      path: c.path,
-      line: c.line,
-      side: 'RIGHT',
-      body: c.body,
-    })),
+    comments: [
+      { path: comment.path, line: comment.line, side: 'RIGHT', body: comment.body },
+    ],
   };
+}
+
+/**
+ * GraphQL で取得した pending review のコメントノード配列から下書き一覧を復元する。
+ * 形が想定と違う要素は黙って捨て、配列でなければ空として扱う。
+ * line は outdated コメント等で null のことがある（その場合ノード対応付け不可）。
+ */
+export function parsePendingComments(raw: unknown): PendingComment[] {
+  if (!Array.isArray(raw)) return [];
+  const comments: PendingComment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const c = item as Record<string, unknown>;
+    if (
+      typeof c.id !== 'string' ||
+      c.id.length === 0 ||
+      typeof c.path !== 'string' ||
+      c.path.length === 0 ||
+      typeof c.body !== 'string'
+    ) {
+      continue;
+    }
+    const line =
+      typeof c.line === 'number' && Number.isInteger(c.line) && c.line >= 1
+        ? c.line
+        : null;
+    comments.push({ id: c.id, path: c.path, line, body: c.body });
+  }
+  return comments;
+}
+
+/**
+ * ノードに対応する下書きコメントを探す（path が一致しコメント可能行に載っているもの）。
+ * 同一ノードに複数マッチする場合は先頭を返す（フォームの編集対象）。
+ */
+export function findCommentForNode(
+  comments: readonly PendingComment[],
+  node: NodeRef
+): PendingComment | undefined {
+  return comments.find(
+    (c) =>
+      c.line !== null &&
+      c.path === node.filePath &&
+      node.commentableLines.includes(c.line)
+  );
+}
+
+/** 下書きマーク（グラフ上の強調）を付けるべきノード ID の集合を求める */
+export function draftNodeIds(
+  comments: readonly PendingComment[],
+  nodes: readonly NodeRef[]
+): Set<string> {
+  const ids = new Set<string>();
+  for (const node of nodes) {
+    if (findCommentForNode(comments, node) !== undefined) ids.add(node.id);
+  }
+  return ids;
 }

@@ -7,15 +7,14 @@ import type {
   FileContentPayload,
   GithubApiError,
   GithubResult,
+  PendingReviewPayload,
   PrFile,
   PrFilesPayload,
   PrInfo,
-  ReviewCommentInput,
-  ReviewCommentPayload,
   ReviewSubmitPayload,
 } from '../shared/github';
 import type { PrRef } from '../shared/messages';
-import { buildReviewRequestBody } from '../shared/review-drafts';
+import { buildPendingReviewCreateBody, parsePendingComments } from '../shared/review-drafts';
 import { getPat } from '../shared/settings';
 
 const API_BASE = 'https://api.github.com';
@@ -40,7 +39,7 @@ interface FetchErr {
 }
 
 async function apiRequest(
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
   pathAndQuery: string,
   body?: unknown
 ): Promise<FetchOk | FetchErr> {
@@ -269,89 +268,269 @@ export async function listDirectory(
   return { ok: true, authMode: r.authMode, value: paths };
 }
 
-/**
- * POST /repos/{owner}/{repo}/pulls/{n}/comments — レビューコメント投稿。
- * line は diff（patch）の RIGHT サイドに含まれる行であること。
- * PAT 未設定なら API を呼ばずに kind: 'pat_required' を返す
- * （UI 側のボタン無効化と合わせた二重防御）。
- */
-export async function postReviewComment(
-  pr: PrRef,
-  params: { commitId: string; path: string; line: number; body: string }
-): Promise<GithubResult<ReviewCommentPayload>> {
-  const pat = await getPat();
-  if (!pat) {
-    return {
-      ok: false,
-      authMode: 'anonymous',
-      error: {
-        kind: 'pat_required',
-        message: 'コメント投稿には PAT の設定が必要です',
-      },
-    };
-  }
-  const r = await apiRequest(
-    'POST',
-    `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/comments`,
-    {
-      body: params.body,
-      commit_id: params.commitId,
-      path: params.path,
-      line: params.line,
-      side: 'RIGHT',
-    }
-  );
-  if (!r.ok) return r;
-  const json = (await r.res.json()) as { html_url: string; id: number };
+/** PAT 必須の操作で PAT が無いときに返す共通エラー */
+function patRequired(message: string): FetchErr {
   return {
-    ok: true,
-    authMode: r.authMode,
-    value: { htmlUrl: json.html_url, id: json.id },
+    ok: false,
+    authMode: 'anonymous',
+    error: { kind: 'pat_required', message },
   };
 }
 
 /**
- * POST /repos/{owner}/{repo}/pulls/{n}/reviews — 溜めた下書きを 1 つのレビューとして
- * まとめて投稿する。event: 'COMMENT' なので approve / request changes にはならない。
- * 各コメントの line は diff（patch）の RIGHT サイドに含まれる行であること。
- * 1 行でも invalid だと 422 で全体が失敗する（部分投稿はされない）ため、
- * 呼び出し側は失敗時に下書きを消さずユーザーが修正して再送できるようにする。
- * PAT 未設定なら API を呼ばずに kind: 'pat_required' を返す（UI 側と二重防御）。
+ * POST /graphql — pending review の取得・操作に使う（pending 状態のレビュー
+ * コメントは REST からは見えず、PATCH / DELETE も効かないため）。
+ * GraphQL はエラーでも HTTP 200 で errors 配列を返すため、ここで GithubApiError に写す。
  */
-export async function submitReview(
-  pr: PrRef,
-  params: { commitId: string; comments: ReviewCommentInput[] }
-): Promise<GithubResult<ReviewSubmitPayload>> {
-  const pat = await getPat();
-  if (!pat) {
+async function graphqlRequest<T>(
+  query: string,
+  variables: Record<string, unknown>
+): Promise<{ ok: true; authMode: AuthMode; data: T } | FetchErr> {
+  const r = await apiRequest('POST', '/graphql', { query, variables });
+  if (!r.ok) return r;
+  const json = (await r.res.json()) as {
+    data?: T;
+    errors?: Array<{ message?: unknown }>;
+  };
+  if (Array.isArray(json.errors) && json.errors.length > 0) {
+    const message = json.errors
+      .map((e) => String(e?.message ?? ''))
+      .filter((s) => s.length > 0)
+      .join(' / ');
     return {
       ok: false,
-      authMode: 'anonymous',
-      error: {
-        kind: 'pat_required',
-        message: 'レビュー投稿には PAT の設定が必要です',
-      },
+      authMode: r.authMode,
+      error: { kind: 'unexpected', message: message || 'GraphQL エラー' },
     };
   }
-  if (params.comments.length === 0) {
+  if (json.data === undefined || json.data === null) {
     return {
       ok: false,
-      authMode: 'pat',
-      error: { kind: 'unexpected', message: '下書きが 1 件もありません' },
+      authMode: r.authMode,
+      error: { kind: 'unexpected', message: 'GraphQL 応答に data がありません' },
     };
   }
-  const r = await apiRequest(
-    'POST',
-    `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews`,
-    buildReviewRequestBody(params.commitId, params.comments)
+  return { ok: true, authMode: r.authMode, data: json.data };
+}
+
+/** GraphQL で取得する pending review の応答形 */
+interface PendingReviewQueryData {
+  repository: {
+    pullRequest: {
+      reviews: {
+        nodes: Array<{
+          id: string;
+          comments: { nodes: unknown[] };
+        } | null>;
+      };
+    } | null;
+  } | null;
+}
+
+/**
+ * 認証ユーザーの pending review とそのコメント一覧を GraphQL で取得する。
+ * reviews(states: PENDING) は認証ユーザー本人の pending review だけを返す
+ * （他人のものは見えず、1 PR につき 1 つまで）。
+ */
+async function fetchPendingReview(
+  pr: PrRef
+): Promise<{ ok: true; authMode: AuthMode; value: PendingReviewPayload } | FetchErr> {
+  const r = await graphqlRequest<PendingReviewQueryData>(
+    `query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          reviews(states: PENDING, first: 1) {
+            nodes { id comments(first: 100) { nodes { id path line body } } }
+          }
+        }
+      }
+    }`,
+    { owner: pr.owner, name: pr.repo, number: pr.pr }
   );
   if (!r.ok) return r;
-  const json = (await r.res.json()) as { html_url: string; id: number };
+  const pullRequest = r.data.repository?.pullRequest;
+  if (!pullRequest) {
+    return {
+      ok: false,
+      authMode: r.authMode,
+      error: { kind: 'not_found', message: `PR が見つかりません: ${pr.owner}/${pr.repo}#${pr.pr}` },
+    };
+  }
+  const pending = pullRequest.reviews.nodes.find((n) => n !== null) ?? null;
+  if (!pending) {
+    return { ok: true, authMode: r.authMode, value: { reviewId: null, comments: [] } };
+  }
   return {
     ok: true,
     authMode: r.authMode,
-    value: { htmlUrl: json.html_url, id: json.id },
+    value: {
+      reviewId: pending.id,
+      comments: parsePendingComments(pending.comments.nodes),
+    },
   };
+}
+
+/**
+ * pending review の現在の状態を取得する。PAT 未設定時はエラーではなく
+ * 「pending review なし」を返す（未認証では pending review は存在し得ないため、
+ * パネルを開いただけでエラー表示にならないようにする）。
+ */
+export async function getPendingReview(
+  pr: PrRef
+): Promise<GithubResult<PendingReviewPayload>> {
+  const pat = await getPat();
+  if (!pat) {
+    return {
+      ok: true,
+      authMode: 'anonymous',
+      value: { reviewId: null, comments: [] },
+    };
+  }
+  return fetchPendingReview(pr);
+}
+
+/**
+ * pending review に下書きコメントを 1 件追加する。
+ * - pending review が無い: POST /pulls/{n}/reviews（event なし = PENDING）で
+ *   コメント込みのレビューを作成する（REST で作成は可能。見えないのは pending の
+ *   コメント取得・更新・削除だけ）
+ * - ある: GraphQL の addPullRequestReviewThread で追記する
+ * どちらも成功後に取得し直した pending review 全体を返す（GitHub 側が正）。
+ * line が diff の RIGHT サイドに無い場合などは失敗する（下書きは増えない）。
+ */
+export async function addPendingComment(
+  pr: PrRef,
+  params: { commitId: string; path: string; line: number; body: string }
+): Promise<GithubResult<PendingReviewPayload>> {
+  const pat = await getPat();
+  if (!pat) return patRequired('下書きの追加には PAT の設定が必要です');
+
+  const state = await fetchPendingReview(pr);
+  if (!state.ok) return state;
+
+  if (state.value.reviewId === null) {
+    const r = await apiRequest(
+      'POST',
+      `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews`,
+      buildPendingReviewCreateBody(params.commitId, params)
+    );
+    if (!r.ok) return r;
+  } else {
+    const r = await graphqlRequest(
+      `mutation($reviewId: ID!, $path: String!, $line: Int!, $body: String!) {
+        addPullRequestReviewThread(input: {
+          pullRequestReviewId: $reviewId, path: $path, line: $line, side: RIGHT, body: $body
+        }) { thread { id } }
+      }`,
+      {
+        reviewId: state.value.reviewId,
+        path: params.path,
+        line: params.line,
+        body: params.body,
+      }
+    );
+    if (!r.ok) return r;
+  }
+  return fetchPendingReview(pr);
+}
+
+/**
+ * GraphQL updatePullRequestReviewComment — 下書きコメントの本文を更新する。
+ * 行の変更はできない（呼び出し側で削除 → 追加し直す）。
+ */
+export async function updatePendingComment(
+  pr: PrRef,
+  commentId: string,
+  body: string
+): Promise<GithubResult<PendingReviewPayload>> {
+  const pat = await getPat();
+  if (!pat) return patRequired('下書きの更新には PAT の設定が必要です');
+  const r = await graphqlRequest(
+    `mutation($commentId: ID!, $body: String!) {
+      updatePullRequestReviewComment(input: {
+        pullRequestReviewCommentId: $commentId, body: $body
+      }) { pullRequestReviewComment { id } }
+    }`,
+    { commentId, body }
+  );
+  if (!r.ok) return r;
+  return fetchPendingReview(pr);
+}
+
+/**
+ * GraphQL deletePullRequestReviewComment — 下書きコメントを削除する。
+ * 最後の 1 件を消して pending review が空になったら、レビュー自体も削除する
+ * （空の pending review が残ると GitHub 側で「レビュー中」状態が続いてしまう）。
+ */
+export async function deletePendingComment(
+  pr: PrRef,
+  commentId: string
+): Promise<GithubResult<PendingReviewPayload>> {
+  const pat = await getPat();
+  if (!pat) return patRequired('下書きの削除には PAT の設定が必要です');
+  const r = await graphqlRequest(
+    `mutation($commentId: ID!) {
+      deletePullRequestReviewComment(input: { id: $commentId }) {
+        pullRequestReview { id }
+      }
+    }`,
+    { commentId }
+  );
+  if (!r.ok) return r;
+  const after = await fetchPendingReview(pr);
+  if (!after.ok) return after;
+  if (after.value.reviewId !== null && after.value.comments.length === 0) {
+    const del = await graphqlRequest(
+      `mutation($reviewId: ID!) {
+        deletePullRequestReview(input: { pullRequestReviewId: $reviewId }) {
+          pullRequestReview { id }
+        }
+      }`,
+      { reviewId: after.value.reviewId }
+    );
+    if (del.ok) {
+      return {
+        ok: true,
+        authMode: del.authMode,
+        value: { reviewId: null, comments: [] },
+      };
+    }
+    // 空レビューの削除に失敗しても下書き削除自体は済んでいるので現状を返す
+  }
+  return after;
+}
+
+/**
+ * GraphQL submitPullRequestReview — pending review を event: COMMENT で
+ * submit する（approve / request changes にはならない）。
+ * 失敗時（push で行が outdated になった等）は pending review が
+ * GitHub 側にそのまま残るので、ユーザーは修正して再送できる。
+ */
+export async function submitPendingReview(
+  reviewId: string
+): Promise<GithubResult<ReviewSubmitPayload>> {
+  const pat = await getPat();
+  if (!pat) return patRequired('レビュー投稿には PAT の設定が必要です');
+  const r = await graphqlRequest<{
+    submitPullRequestReview: { pullRequestReview: { url: string } | null } | null;
+  }>(
+    `mutation($reviewId: ID!) {
+      submitPullRequestReview(input: { pullRequestReviewId: $reviewId, event: COMMENT }) {
+        pullRequestReview { url }
+      }
+    }`,
+    { reviewId }
+  );
+  if (!r.ok) return r;
+  const url = r.data.submitPullRequestReview?.pullRequestReview?.url;
+  if (typeof url !== 'string') {
+    return {
+      ok: false,
+      authMode: r.authMode,
+      error: { kind: 'unexpected', message: 'レビュー投稿の応答が想定外の形です' },
+    };
+  }
+  return { ok: true, authMode: r.authMode, value: { htmlUrl: url } };
 }
 
 /** PAT があれば GET /user で有効性確認、なければ GET /rate_limit で疎通確認 */

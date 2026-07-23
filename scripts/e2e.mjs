@@ -21,14 +21,18 @@
 // - コメント可能ノード: 対象行の表示 / コメント不可ノード: 理由の表示（diff 外 / 関数無変更）
 // - PAT 未設定での投稿要求は background が pat_required で拒否（二重防御）
 //
-// feat/batch-review-comments で追加した確認項目:
-// - 「下書きに追加」は即送信されず、下書き一覧に溜まる（2 ノードで 2 件 + 件数バッジ +
-//   グラフ上の has-draft マーク）
-// - 下書きの編集（一覧の「編集」→ プリフィル → 更新）と削除が一覧に反映される
-// - パネルを閉じて開き直しても、ページをリロードしても下書きが残る（chrome.storage.session）
-// - 未認証時は「まとめて送信」無効 + PAT 導線。SUBMIT_REVIEW も pat_required で拒否
-// - ダミー PAT 保存 → 送信ボタンが自動活性化し、まとめて送信で 401 が人間可読で表示され、
-//   下書きが消えない（実 PR への投稿はされない。無効 PAT のため GitHub 側で拒否される）
+// feat/batch-review-comments で追加した確認項目（多くは pending-review-integration で置換）:
+// - 下書きの一覧表示（件数バッジ + グラフ上の has-draft マーク）と編集・削除の UI
+//
+// feat/pending-review-integration で追加した確認項目:
+// - 下書きが GitHub ネイティブの pending review に統合され、拡張独自のローカルキュー
+//   （chrome.storage.session）は廃止（下書き操作はすべて PAT 必須になった）
+// - 未認証時: 「下書きに追加」無効 + PAT 導線（コメントフォーム・下書きペインの両方）
+// - GET_PENDING_REVIEW は PAT 未設定でもエラーでなく「pending review なし」を返す
+// - ADD_PENDING_COMMENT / SUBMIT_PENDING_REVIEW は PAT 未設定なら pat_required で拒否
+// - ダミー PAT 保存 → 「下書きに追加」が自動活性化（storage.onChanged）し、
+//   pending review 取得の 401 が人間可読で表示される。「下書きに追加」も 401 が
+//   表示され、下書きは増えない（実 PR への下書き作成・投稿はされない）
 //
 // feat/syntax-highlight で追加した確認項目:
 // - ノード詳細のソースがシンタックスハイライトされる（.source code 内に tok-* の span）
@@ -361,6 +365,14 @@ try {
           const el = shadow?.querySelector('.draft-remove');
           return !!el && !el.hidden;
         })(),
+        commentAuthVisible: (() => {
+          const el = shadow?.querySelector('.comment-auth');
+          return !!el && getComputedStyle(el).display !== 'none';
+        })(),
+        commentStatusState:
+          shadow?.querySelector('.comment-status')?.dataset.state ?? '',
+        commentStatusText:
+          (shadow?.querySelector('.comment-status')?.textContent ?? '').trim(),
         disabledReason: (shadow?.querySelector('.comment-disabled')?.textContent ?? '').trim(),
       };
     });
@@ -396,16 +408,6 @@ try {
         })(),
       };
     });
-  const waitForDraftCount = (expected) =>
-    page.waitForFunction(
-      (exp) => {
-        const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
-        return (shadow?.querySelector('.drafts-count')?.textContent ?? '').trim() === exp;
-      },
-      String(expected),
-      { timeout: 15_000 }
-    );
-
   await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
   const detail = await readDetail();
   record(
@@ -446,23 +448,26 @@ try {
   );
   await shot(page, '5-filter-all-nodes');
 
-  // 6.3. コメント可能ノード: 対象行の表示 + 「下書きに追加」は本文が空の間だけ無効
-  //      （追加は PAT 不要。PAT が要るのは「まとめて送信」だけ）
+  // 6.3. コメント可能ノード: 対象行の表示 + 未認証では「下書きに追加」が無効で
+  //      PAT 導線が出ること（下書きは GitHub の pending review に保存されるため
+  //      追加の時点から PAT が必要）
   await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
   const cDetail = await readDetail();
   record(
-    'commentable node: target line shown + add-draft disabled while body empty',
+    'commentable node: target line shown + add-draft disabled + PAT hint while anonymous',
     cDetail.hasCommentInput && cDetail.commentTarget.includes('にコメントされます') &&
       cDetail.addDisabled === true && cDetail.addLabel === '下書きに追加' &&
-      !cDetail.removeVisible,
-    `target="${cDetail.commentTarget}" addDisabled=${cDetail.addDisabled} label="${cDetail.addLabel}"`
+      cDetail.commentAuthVisible && !cDetail.removeVisible,
+    `target="${cDetail.commentTarget}" addDisabled=${cDetail.addDisabled} ` +
+      `label="${cDetail.addLabel}" authVisible=${cDetail.commentAuthVisible}`
   );
   const emptyDrafts = await readDrafts();
   record(
-    'drafts pane: starts empty (count 0, submit disabled)',
+    'drafts pane: starts empty (count 0, submit disabled, PAT hint shown)',
     emptyDrafts.count === '0' && emptyDrafts.submitDisabled === true &&
-      emptyDrafts.items.length === 0,
-    `count=${emptyDrafts.count} submitDisabled=${emptyDrafts.submitDisabled}`
+      emptyDrafts.items.length === 0 && emptyDrafts.authVisible,
+    `count=${emptyDrafts.count} submitDisabled=${emptyDrafts.submitDisabled} ` +
+      `authVisible=${emptyDrafts.authVisible}`
   );
   await shot(page, '5b-commentable-node-anonymous');
 
@@ -632,13 +637,33 @@ try {
   record('options: PAT deleted from chrome.storage.local', cleared.githubPat === undefined);
   await shot(optionsPage, '11-options-pat-deleted');
 
-  // === Phase 5: レビューコメント投稿（実 PR には投稿されない検証のみ） ===
+  // === pending review 統合: 下書き操作の検証（実 PR には下書きも投稿もされない） ===
 
-  // 14. PAT 未設定での投稿要求は background が pat_required で拒否すること（二重防御）
-  const patRequired = await optionsPage.evaluate(
+  // 14. PAT 未設定の GET_PENDING_REVIEW はエラーでなく「pending review なし」を返すこと
+  //     （未認証では pending review は存在し得ないため、パネルを開いただけで
+  //     エラー表示にならない）
+  const anonPending = await optionsPage.evaluate(
     ([owner, name]) =>
       chrome.runtime.sendMessage({
-        type: 'POST_REVIEW_COMMENT',
+        type: 'GET_PENDING_REVIEW',
+        pr: { owner, repo: name, pr: 1 },
+      }),
+    repo.split('/')
+  );
+  record(
+    'pending review: GET without PAT -> ok with empty state (no API call)',
+    anonPending?.ok === true && anonPending?.value?.reviewId === null &&
+      Array.isArray(anonPending?.value?.comments) &&
+      anonPending.value.comments.length === 0,
+    JSON.stringify(anonPending)
+  );
+
+  // 14b. 書き込み系（下書き追加 / レビュー送信）は PAT 未設定なら GitHub に到達する前に
+  //      pat_required で拒否されること（UI 側のボタン無効化との二重防御）
+  const addPatRequired = await optionsPage.evaluate(
+    ([owner, name]) =>
+      chrome.runtime.sendMessage({
+        type: 'ADD_PENDING_COMMENT',
         pr: { owner, repo: name, pr: 1 },
         commitId: 'deadbeef',
         path: 'src/x.ts',
@@ -648,32 +673,28 @@ try {
     repo.split('/')
   );
   record(
-    'comment: post without PAT -> pat_required (no API call)',
-    patRequired?.ok === false && patRequired?.error?.kind === 'pat_required',
-    JSON.stringify(patRequired?.error ?? patRequired)
+    'pending review: add comment without PAT -> pat_required (no API call)',
+    addPatRequired?.ok === false && addPatRequired?.error?.kind === 'pat_required',
+    JSON.stringify(addPatRequired?.error ?? addPatRequired)
   );
-
-  // 14b. SUBMIT_REVIEW も同様に PAT 未設定なら GitHub に到達する前に拒否されること
-  const reviewPatRequired = await optionsPage.evaluate(
+  const submitPatRequired = await optionsPage.evaluate(
     ([owner, name]) =>
       chrome.runtime.sendMessage({
-        type: 'SUBMIT_REVIEW',
+        type: 'SUBMIT_PENDING_REVIEW',
         pr: { owner, repo: name, pr: 1 },
-        commitId: 'deadbeef',
-        comments: [
-          { path: 'src/x.ts', line: 1, body: 'e2e: should be rejected before reaching GitHub' },
-        ],
+        reviewId: 'PRR_dummy',
       }),
     repo.split('/')
   );
   record(
-    'review: submit without PAT -> pat_required (no API call)',
-    reviewPatRequired?.ok === false && reviewPatRequired?.error?.kind === 'pat_required',
-    JSON.stringify(reviewPatRequired?.error ?? reviewPatRequired)
+    'pending review: submit without PAT -> pat_required (no API call)',
+    submitPatRequired?.ok === false && submitPatRequired?.error?.kind === 'pat_required',
+    JSON.stringify(submitPatRequired?.error ?? submitPatRequired)
   );
 
   // 15. PR ページでパネルを開き直し（未認証・SW キャッシュ）、フィルタを外して
-  //     2 つのコメント可能ノードに下書きを追加 → 一覧に 2 件 + 件数バッジ + グラフのマーク
+  //     コメント可能ノードに本文を入れても、PAT 未設定の間は「下書きに追加」が
+  //     無効のまま（PAT 導線が出続ける）であること
   await page.bringToFront();
   await page.locator(BUTTON).click();
   await waitForGraphStatus();
@@ -684,113 +705,21 @@ try {
     .locator('#functions-tree-panel-host .graph-area g.node.commentable')
     .first()
     .waitFor({ timeout: 30_000 });
-  const commentable = page.locator('#functions-tree-panel-host .graph-area g.node.commentable');
-  const commentableCount = await commentable.count();
+  await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
+  await page
+    .locator('#functions-tree-panel-host .comment-input')
+    .fill('e2e 下書き（GitHub の pending review に保存される想定）');
+  const filledAnon = await readDetail();
+  record(
+    'drafts: add stays disabled with body while anonymous (PAT hint shown)',
+    filledAnon.addDisabled === true && filledAnon.commentAuthVisible,
+    `addDisabled=${filledAnon.addDisabled} authVisible=${filledAnon.commentAuthVisible}`
+  );
+  await shot(page, '12-add-disabled-anonymous');
 
-  const draft1Text = 'e2e 下書き 1（まとめて送信するまで投稿されない）';
-  await commentable.first().click();
-  await page.locator('#functions-tree-panel-host .comment-input').fill(draft1Text);
-  await page.locator('#functions-tree-panel-host .draft-add').click();
-  const afterFirst = await readDrafts();
-  record(
-    'drafts: add first draft -> queued locally (count 1, not sent)',
-    afterFirst.count === '1' && afterFirst.items.length === 1 &&
-      afterFirst.items[0].name !== '' && /:L\d+$/.test(afterFirst.items[0].loc) &&
-      afterFirst.items[0].preview.includes('e2e 下書き 1'),
-    `count=${afterFirst.count} item=${JSON.stringify(afterFirst.items[0])}`
-  );
-
-  if (commentableCount >= 2) {
-    const draft2Text = 'e2e 下書き 2（複数ノードに溜められる）';
-    await commentable.nth(1).click();
-    await page.locator('#functions-tree-panel-host .comment-input').fill(draft2Text);
-    await page.locator('#functions-tree-panel-host .draft-add').click();
-  }
-  const afterSecond = await readDrafts();
-  record(
-    'drafts: two drafts across nodes (count badge 2 + has-draft marks on graph)',
-    commentableCount >= 2 && afterSecond.count === '2' &&
-      afterSecond.items.length === 2 && afterSecond.draftMarks === 2 &&
-      afterSecond.markStroke === 'rgb(188, 76, 0)', // #bc4c00 が classDef を上書きできている
-    `commentableNodes=${commentableCount} count=${afterSecond.count} ` +
-      `marks=${afterSecond.draftMarks} stroke=${afterSecond.markStroke}`
-  );
-  record(
-    'drafts: submit disabled + PAT link while anonymous',
-    afterSecond.submitDisabled === true && afterSecond.authVisible &&
-      afterSecond.submitLabel.includes('件の下書きをまとめて送信'),
-    `submitDisabled=${afterSecond.submitDisabled} authVisible=${afterSecond.authVisible} label="${afterSecond.submitLabel}"`
-  );
-  await shot(page, '12-drafts-two-items-no-pat');
-
-  // 16. 下書きの編集: 一覧の「編集」→ フォームにプリフィル → 本文を変えて「下書きを更新」
-  await page.locator('#functions-tree-panel-host .draft-item .draft-edit').first().click();
-  const editDetail = await readDetail();
-  record(
-    'drafts: edit button prefills form (body + update/delete buttons)',
-    editDetail.inputValue === draft1Text && editDetail.addLabel === '下書きを更新' &&
-      editDetail.removeVisible,
-    `input="${editDetail.inputValue}" label="${editDetail.addLabel}" remove=${editDetail.removeVisible}`
-  );
-  const editedText = 'e2e 下書き 1（編集済み）';
-  await page.locator('#functions-tree-panel-host .comment-input').fill(editedText);
-  await page.locator('#functions-tree-panel-host .draft-add').click();
-  const afterEdit = await readDrafts();
-  record(
-    'drafts: update reflects in list (count stays 2, preview updated)',
-    afterEdit.count === '2' &&
-      afterEdit.items.some((i) => i.preview.includes('編集済み')),
-    `count=${afterEdit.count} previews=${JSON.stringify(afterEdit.items.map((i) => i.preview))}`
-  );
-  await shot(page, '13-draft-edited');
-
-  // 17. 下書きの削除: 一覧の「削除」→ 1 件に減る → 再追加して 2 件に戻す
-  await page.locator('#functions-tree-panel-host .draft-item .draft-delete').nth(1).click();
-  const afterDelete = await readDrafts();
-  record(
-    'drafts: delete removes one draft (count 2 -> 1)',
-    afterDelete.count === '1' && afterDelete.items.length === 1 &&
-      afterDelete.draftMarks === 1,
-    `count=${afterDelete.count} marks=${afterDelete.draftMarks}`
-  );
-  if (commentableCount >= 2) {
-    await commentable.nth(1).click();
-    await page
-      .locator('#functions-tree-panel-host .comment-input')
-      .fill('e2e 下書き 2（削除後の再追加）');
-    await page.locator('#functions-tree-panel-host .draft-add').click();
-  }
-
-  // 18. パネルを閉じて開き直しても下書きが残ること（chrome.storage.session への退避）
-  await page.locator(BUTTON).click(); // close
-  await page.locator(BUTTON).click(); // reopen
-  await waitForGraphStatus();
-  await waitForGraphRender();
-  await waitForDraftCount(2);
-  const afterReopen = await readDrafts();
-  record(
-    'drafts: survive panel close/reopen (restored from storage.session)',
-    afterReopen.count === '2' && afterReopen.items.length === 2,
-    `count=${afterReopen.count}`
-  );
-  await shot(page, '14-drafts-persist-reopen');
-
-  // 19. ページを丸ごとリロード（content script 再注入）でも下書きが残ること
-  await page.reload({ waitUntil: 'domcontentloaded' });
-  await page.locator(BUTTON).waitFor({ timeout: 15_000 });
-  await page.locator(BUTTON).click();
-  await waitForGraphStatus();
-  await waitForGraphRender();
-  await waitForDraftCount(2);
-  const afterReload = await readDrafts();
-  record(
-    'drafts: survive full page reload (content script re-injected)',
-    afterReload.count === '2' && afterReload.items.length === 2,
-    `count=${afterReload.count}`
-  );
-  await shot(page, '15-drafts-persist-reload');
-
-  // 20. 別タブの options でダミー PAT を保存 → storage.onChanged で送信ボタンが自動活性化
+  // 16. 別タブの options でダミー PAT を保存 → storage.onChanged で「下書きに追加」が
+  //     自動活性化すること（書きかけの本文は消えない）。同時に pending review の
+  //     取得が走り、無効 PAT なので 401 が人間可読で表示されること（エラー経路）
   await optionsPage.fill('#pat-input', DUMMY_PAT);
   await optionsPage.click('#save');
   await optionsPage.waitForFunction(
@@ -802,41 +731,55 @@ try {
   await page.waitForFunction(
     () => {
       const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
-      const submit = shadow?.querySelector('.review-submit');
-      return !!submit && submit.disabled === false;
+      const add = shadow?.querySelector('.draft-add');
+      const status = shadow?.querySelector('.review-status');
+      // 追加ボタンの活性化と pending review 取得（401 エラー表示）の両方を待つ
+      return !!add && add.disabled === false &&
+        !!status && status.dataset.state === 'error';
     },
     undefined,
-    { timeout: 10_000 }
+    { timeout: 15_000 }
   );
-  const enabledDrafts = await readDrafts();
+  const enabledDetail = await readDetail();
+  const pendingFetch = await readDrafts();
   record(
-    'drafts: submit auto-enabled after PAT saved (storage.onChanged)',
-    enabledDrafts.submitDisabled === false && !enabledDrafts.authVisible &&
-      enabledDrafts.submitLabel === '2 件の下書きをまとめて送信',
-    `submitDisabled=${enabledDrafts.submitDisabled} label="${enabledDrafts.submitLabel}"`
+    'drafts: add auto-enabled after PAT saved (storage.onChanged, body kept)',
+    enabledDetail.addDisabled === false && !enabledDetail.commentAuthVisible &&
+      enabledDetail.inputValue.includes('e2e 下書き'),
+    `addDisabled=${enabledDetail.addDisabled} authVisible=${enabledDetail.commentAuthVisible} ` +
+      `input="${enabledDetail.inputValue}"`
   );
-  await shot(page, '16-drafts-submit-enabled');
+  record(
+    'pending review: fetch with invalid PAT -> human-readable 401',
+    pendingFetch.statusState === 'error' && pendingFetch.statusText.includes('PAT が無効'),
+    `state=${pendingFetch.statusState} text="${pendingFetch.statusText}"`
+  );
+  await shot(page, '13-add-enabled-after-pat');
 
-  // 21. まとめて送信 → 無効 PAT なので 401 が人間可読で表示され、下書きは消えないこと
-  //     （実 PR への投稿はされない）
-  await page.locator('#functions-tree-panel-host .review-submit').click();
+  // 17. 「下書きに追加」→ 無効 PAT なので 401 が人間可読で表示され、下書きは増えないこと
+  //     （実 PR に pending review は作られない。GitHub 側で拒否される）
+  await page.locator('#functions-tree-panel-host .draft-add').click();
   await page.waitForFunction(
     () => {
       const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
-      const el = shadow?.querySelector('.review-status');
+      const el = shadow?.querySelector('.comment-status');
       return !!el && el.dataset.state !== 'posting' && (el.textContent ?? '') !== '';
     },
     undefined,
     { timeout: 30_000 }
   );
-  const submitResult = await readDrafts();
+  const addResult = await readDetail();
+  const draftsAfterAdd = await readDrafts();
   record(
-    'review: submit with invalid PAT -> human-readable 401, drafts kept',
-    submitResult.statusState === 'error' && submitResult.statusText.includes('PAT が無効') &&
-      submitResult.count === '2' && submitResult.items.length === 2,
-    `state=${submitResult.statusState} text="${submitResult.statusText}" count=${submitResult.count}`
+    'drafts: add with invalid PAT -> human-readable 401, no draft created',
+    addResult.commentStatusState === 'error' &&
+      addResult.commentStatusText.includes('PAT が無効') &&
+      draftsAfterAdd.count === '0' && draftsAfterAdd.items.length === 0 &&
+      draftsAfterAdd.submitDisabled === true,
+    `state=${addResult.commentStatusState} text="${addResult.commentStatusText}" ` +
+      `count=${draftsAfterAdd.count}`
   );
-  await shot(page, '17-review-submit-401-drafts-kept');
+  await shot(page, '14-add-401-no-draft');
 
   // 後始末: ダミー PAT を削除
   await optionsPage.click('#delete');
@@ -904,7 +847,7 @@ try {
     .first()
     .waitFor({ timeout: 30_000 });
   await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
-  // このノードには下書きがありフォームにプリフィルされるため、空にしてから打鍵する
+  // フォームが空であることを保証してから打鍵する
   await page.locator('#functions-tree-panel-host .comment-input').fill('');
   await page.locator('#functions-tree-panel-host .comment-input').click();
   await page.keyboard.type('t');
