@@ -27,6 +27,8 @@ export interface RenderHandle {
   setSelected(nodeId: string | null): void;
   /** 下書きのあるノードにマークを付ける。CSS は .has-draft クラスで当てる */
   setDraftMarks(nodeIds: ReadonlySet<string>): void;
+  /** グラフの表示倍率を設定する（1 が実寸）。スクロールは呼び出し側が調整する */
+  setZoom(scale: number): void;
 }
 
 /** グラフ描画エンジンの抽象。mermaid 以外（Cytoscape.js 等）への差し替え口 */
@@ -143,6 +145,23 @@ class MermaidRenderer implements GraphRenderer {
     fixClippedLabels(container);
     fixArrowMarkers(container);
 
+    // ズームの基準サイズ。useMaxWidth: false なので mermaid は width/height 属性に
+    // 実寸（px 数値）を出すが、万一欠けていたら bbox から補う。
+    // setZoom は width/height 属性だけを倍率で書き換える（viewBox は据え置きなので
+    // 中身が等倍で拡縮され、あふれた分は .graph-scroll 側のスクロールで見る）
+    const svgEl = container.querySelector('svg');
+    const attrSize = (name: 'width' | 'height'): number => {
+      const v = Number(svgEl?.getAttribute(name));
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    };
+    let baseWidth = attrSize('width');
+    let baseHeight = attrSize('height');
+    if (svgEl && (baseWidth <= 0 || baseHeight <= 0)) {
+      const bbox = svgEl.getBBox();
+      baseWidth = baseWidth > 0 ? baseWidth : bbox.width;
+      baseHeight = baseHeight > 0 ? baseHeight : bbox.height;
+    }
+
     const elementByGraphId = new Map<string, SVGGElement>();
     for (const el of container.querySelectorAll<SVGGElement>('g.node')) {
       // g.node の id は `flowchart-<mermaidId>-<連番>` 形式
@@ -193,6 +212,11 @@ class MermaidRenderer implements GraphRenderer {
       setDraftMarks(nodeIds: ReadonlySet<string>): void {
         draftIds = nodeIds;
         applyHighlights();
+      },
+      setZoom(scale: number): void {
+        if (!svgEl || baseWidth <= 0 || baseHeight <= 0) return;
+        svgEl.setAttribute('width', String(baseWidth * scale));
+        svgEl.setAttribute('height', String(baseHeight * scale));
       },
     };
   }
