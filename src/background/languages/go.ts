@@ -14,6 +14,7 @@
 
 import type { Node } from 'web-tree-sitter';
 import { languageMetadata } from '../../shared/languages';
+import type { HighlightConfig } from '../highlight';
 import type {
   DependencyTarget,
   FetchFileResult,
@@ -35,6 +36,29 @@ const FUNCTIONS_QUERY = `
 const IMPORTS_QUERY = `
 (import_spec) @import
 `;
+
+const HIGHLIGHT: HighlightConfig = {
+  wholeNodeTypes: {
+    comment: 'comment',
+    // 引用符・内容・escape_sequence が子に分かれるので全体を string で塗る
+    interpreted_string_literal: 'string',
+    raw_string_literal: 'string',
+  },
+  leafTypes: {
+    rune_literal: 'string',
+    int_literal: 'number',
+    float_literal: 'number',
+    imaginary_literal: 'number',
+    type_identifier: 'type',
+    true: 'constant',
+    false: 'constant',
+    nil: 'constant',
+    iota: 'constant',
+  },
+  functionDefTypes: ['function_declaration', 'method_declaration'],
+  calls: [{ type: 'call_expression', field: 'function' }],
+  member: { type: 'selector_expression', field: 'field' },
+};
 
 interface GoState {
   /** go.mod の module 宣言。リポジトリルートに go.mod がなければ null */
@@ -75,6 +99,7 @@ export const goLanguage: LanguageDefinition = {
   grammarKeyFor: () => 'go',
   functionsQuery: FUNCTIONS_QUERY,
   importsQuery: IMPORTS_QUERY,
+  highlight: HIGHLIGHT,
   isFunctionBoundary,
 
   analyze(path: string, rootNode: Node, queries: LanguageQueries): FileAnalysis {
@@ -95,6 +120,8 @@ export const goLanguage: LanguageDefinition = {
         isMethod,
         startLine: funcNode.startPosition.row + 1,
         endLine: funcNode.endPosition.row + 1,
+        startIndex: funcNode.startIndex,
+        endIndex: funcNode.endIndex,
         // Go の公開判定は先頭大文字。メソッドはパッケージ関数として呼べないので対象外
         exportName: !isMethod && /^\p{Lu}/u.test(bare) ? bare : undefined,
         sourceText: funcNode.text,

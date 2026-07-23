@@ -15,6 +15,7 @@ import type {
 } from '../shared/graph';
 import type { PatchCommentableLines } from './diff-lines';
 import { commentableLinesForRange, parsePatchCommentableLines } from './diff-lines';
+import { collectHighlightTokens, tokensForRange } from './highlight';
 import { LANGUAGE_DEFINITIONS, languageForPath } from './languages';
 import type {
   FileAnalysis,
@@ -123,7 +124,13 @@ export async function createAnalyzer(wasm: AnalyzerWasmSource): Promise<Analyzer
       const tree = parser.parse(source);
       if (!tree) throw new Error(`パースに失敗しました: ${path}`);
       try {
-        return def.analyze(path, tree.rootNode, grammar.queries);
+        const analysis = def.analyze(path, tree.rootNode, grammar.queries);
+        // ハイライトはファイル全体で 1 回抽出し、各関数の文字範囲に切り出して割り当てる
+        const tokens = collectHighlightTokens(tree.rootNode, def.highlight);
+        for (const fn of analysis.functions) {
+          fn.highlights = tokensForRange(tokens, fn.startIndex, fn.endIndex);
+        }
+        return analysis;
       } finally {
         tree.delete();
       }
@@ -387,6 +394,7 @@ function assembleGraph(
         commentableLines: lines,
         commentLine,
         sourceText: fn.sourceText,
+        highlightTokens: fn.highlights ?? [],
       });
       const callName = fn.callName ?? fn.name;
       if (fn.isMethod) {
