@@ -10,7 +10,7 @@ export type GithubErrorKind =
   | 'rate_limited' // 403/429 かつレート残量 0
   | 'not_found' // 404: PR やファイルが存在しない / private で権限なし
   | 'too_large' // contents API の 1MB 上限超え
-  | 'pat_required' // PAT 未設定で書き込み系 API（コメント投稿）を呼ぼうとした
+  | 'pat_required' // PAT 未設定で書き込み系 API（下書き操作・レビュー投稿）を呼ぼうとした
   | 'network' // fetch 自体の失敗（オフライン等）
   | 'unexpected'; // その他
 
@@ -62,14 +62,7 @@ export interface FileContentPayload {
   content: string;
 }
 
-/** POST /pulls/{n}/comments の成功応答（UI 表示に必要な分だけ） */
-export interface ReviewCommentPayload {
-  /** 作成されたコメントの PR ページ上の URL */
-  htmlUrl: string;
-  id: number;
-}
-
-/** POST /pulls/{n}/reviews に載せるインラインコメント 1 件分（side は常に RIGHT） */
+/** pending review に載せるインラインコメント 1 件分（side は常に RIGHT） */
 export interface ReviewCommentInput {
   /** リポジトリルートからのファイルパス */
   path: string;
@@ -79,11 +72,39 @@ export interface ReviewCommentInput {
   body: string;
 }
 
-/** POST /pulls/{n}/reviews の成功応答（UI 表示に必要な分だけ） */
+/**
+ * pending review（GitHub ネイティブの下書きレビュー）上のコメント 1 件。
+ * pending 状態のコメントは REST API からは見えない（一覧が空になり
+ * PATCH / DELETE も効かない）ため、取得・操作はすべて GraphQL API で行い、
+ * ID も GraphQL のノード ID（文字列）で持つ。
+ * 拡張が作るコメントのほか、GitHub の PR 画面で作られた下書きも
+ * 同じ pending review に載ってくる（outdated で行が取れないものもあり得る）。
+ */
+export interface PendingComment {
+  /** GraphQL のノード ID（updatePullRequestReviewComment 等に渡す） */
+  id: string;
+  /** リポジトリルートからのファイルパス */
+  path: string;
+  /** コメント先の行（1 始まり）。outdated 等で取れない場合は null */
+  line: number | null;
+  /** コメント本文（Markdown） */
+  body: string;
+}
+
+/**
+ * pending review の現在の状態。reviewId === null は「pending review なし」
+ * （このとき comments は空）。
+ */
+export interface PendingReviewPayload {
+  /** pending review の GraphQL ノード ID */
+  reviewId: string | null;
+  comments: PendingComment[];
+}
+
+/** submitPullRequestReview（レビュー投稿）の成功応答（UI 表示に必要な分だけ） */
 export interface ReviewSubmitPayload {
-  /** 作成されたレビューの PR ページ上の URL */
+  /** 投稿されたレビューの PR ページ上の URL */
   htmlUrl: string;
-  id: number;
 }
 
 export interface AuthTestPayload {
@@ -111,7 +132,7 @@ export function describeGithubError(error: GithubApiError): string {
     case 'too_large':
       return 'ファイルが大きすぎて取得できません（contents API の 1MB 上限）。';
     case 'pat_required':
-      return 'コメント投稿には PAT が必要です。設定ページで PAT を設定してください。';
+      return '下書き（pending review）の操作には PAT が必要です。設定ページで PAT を設定してください。';
     case 'network':
       return `GitHub API に接続できませんでした: ${error.message}`;
     default:

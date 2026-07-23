@@ -4,18 +4,17 @@
 // mermaid 本体（約 3MB）は dist/mermaid-view.js に別バンドルしてあり、
 // 初回描画時に動的 import する（content.js 自体は軽いまま）。
 
+import type { PendingComment, PendingReviewPayload } from '../shared/github';
 import { describeGithubError } from '../shared/github';
 import type { FunctionGraph, GraphNode, HighlightToken } from '../shared/graph';
-import type { PrRef } from '../shared/messages';
+import type {
+  AddPendingCommentRequest,
+  DeletePendingCommentRequest,
+  PrRef,
+  UpdatePendingCommentRequest,
+} from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
-import type { ReviewDraft } from '../shared/review-drafts';
-import {
-  draftStorageKey,
-  findDraft,
-  parseDrafts,
-  removeDraft,
-  upsertDraft,
-} from '../shared/review-drafts';
+import { draftNodeIds, findCommentForNode } from '../shared/review-drafts';
 import { getPat, PAT_KEY } from '../shared/settings';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
@@ -526,6 +525,22 @@ const PANEL_CSS = `
   border-radius: 999px;
 }
 .drafts-count[data-empty="true"] { background: rgba(140, 149, 159, 0.6); }
+.drafts-refresh {
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid rgba(140, 149, 159, 0.5);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.drafts-refresh:hover:enabled {
+  background: rgba(140, 149, 159, 0.2);
+}
+.drafts-refresh:disabled {
+  color: #59636e;
+  cursor: not-allowed;
+}
 .review-submit {
   margin-left: auto;
   padding: 4px 12px;
@@ -657,15 +672,21 @@ let sidePaneEl: HTMLElement | null = null;
 let nodeCountEl: HTMLElement | null = null;
 let draftsListEl: HTMLElement | null = null;
 let draftsCountEl: HTMLElement | null = null;
+let draftsRefreshEl: HTMLButtonElement | null = null;
 let reviewSubmitEl: HTMLButtonElement | null = null;
 let reviewStatusEl: HTMLElement | null = null;
 let draftsAuthEl: HTMLElement | null = null;
 let currentPr: PrRef | null = null;
 
-// レビュー下書きキュー。ここが正で、変更のたびに chrome.storage.session へ退避する
-// （SPA 遷移でパネルが破棄・再注入されても復元できる。キーは PR ごと）。
-let drafts: ReviewDraft[] = [];
-// SUBMIT_REVIEW の送信中フラグ（二重送信防止）
+// GitHub の pending review（ネイティブの下書きレビュー）の状態。GitHub 側が正で、
+// 取得・変更のたびに background 応答の内容へ丸ごと置き換える（ローカル退避はしない。
+// 下書きは GitHub の PR 画面からも見え、ブラウザを閉じても消えない）。
+let pendingReviewId: string | null = null;
+let drafts: PendingComment[] = [];
+// pending review への操作（取得・追加・更新・削除）の実行中フラグ。
+// GitHub 側の状態が正なので、並行して変更しないよう 1 操作ずつに絞る
+let draftsBusy = false;
+// SUBMIT_PENDING_REVIEW の送信中フラグ（二重送信防止）
 let submitting = false;
 
 let currentGraph: FunctionGraph | null = null;
@@ -690,7 +711,17 @@ chrome.storage.onChanged.addListener((changes, area) => {
   const v = changes[PAT_KEY].newValue as unknown;
   patConfigured = typeof v === 'string' && v.length > 0;
   commentUiUpdater?.();
-  renderDrafts(); // まとめて送信ボタンの活性・PAT 導線も追従させる
+  // PAT が設定されたら pending review を取りに行く（その PAT の下書きが既にあるかも
+  // しれない）。外されたら pending review は見えなくなるので表示を空にする
+  if (panelHost && currentPr) {
+    if (patConfigured) {
+      void loadPendingReview(currentPr);
+    } else {
+      pendingReviewId = null;
+      drafts = [];
+    }
+  }
+  renderDrafts(); // 送信ボタンの活性・PAT 導線も追従させる
 });
 /**
  * パネル表示中の Esc キー処理。document の capture で拾う
@@ -1077,16 +1108,27 @@ function buildDraftsPane(): HTMLElement {
   title.textContent = '下書き';
   draftsCountEl = document.createElement('span');
   draftsCountEl.className = 'drafts-count';
+  // GitHub の PR 画面で作った下書きをパネルを開いたまま反映するための再取得ボタン
+  draftsRefreshEl = document.createElement('button');
+  draftsRefreshEl.className = 'drafts-refresh';
+  draftsRefreshEl.type = 'button';
+  draftsRefreshEl.textContent = '再読み込み';
+  draftsRefreshEl.title = 'GitHub から下書き（pending review）を取得し直す';
+  draftsRefreshEl.addEventListener('click', () => {
+    if (draftsBusy || !patConfigured || !currentPr) return;
+    void loadPendingReview(currentPr);
+  });
   reviewSubmitEl = document.createElement('button');
   reviewSubmitEl.className = 'review-submit';
   reviewSubmitEl.type = 'button';
   reviewSubmitEl.addEventListener('click', submitAllDrafts);
-  header.append(title, draftsCountEl, reviewSubmitEl);
+  header.append(title, draftsCountEl, draftsRefreshEl, reviewSubmitEl);
 
   draftsAuthEl = document.createElement('div');
   draftsAuthEl.className = 'drafts-auth';
   const authText = document.createElement('span');
-  authText.textContent = 'まとめて送信には PAT が必要です。';
+  authText.textContent =
+    '下書きは GitHub の pending review に保存されるため、利用には PAT が必要です。';
   const openOptions = document.createElement('button');
   openOptions.className = 'open-options';
   openOptions.type = 'button';
@@ -1114,65 +1156,111 @@ function renderDrafts(): void {
   draftsCountEl.dataset.empty = drafts.length === 0 ? 'true' : 'false';
   reviewSubmitEl.textContent = submitting
     ? '送信中…'
-    : `${drafts.length} 件の下書きをまとめて送信`;
-  reviewSubmitEl.disabled = submitting || drafts.length === 0 || !patConfigured;
-  draftsAuthEl.dataset.visible =
-    !patConfigured && drafts.length > 0 ? 'true' : 'false';
+    : `${drafts.length} 件の下書きをレビューとして送信`;
+  reviewSubmitEl.disabled =
+    submitting ||
+    draftsBusy ||
+    drafts.length === 0 ||
+    pendingReviewId === null ||
+    !patConfigured;
+  if (draftsRefreshEl) draftsRefreshEl.disabled = draftsBusy || !patConfigured;
+  // 下書きは GitHub の pending review に保存するため、追加の時点から PAT が必要
+  draftsAuthEl.dataset.visible = patConfigured ? 'false' : 'true';
   if (drafts.length === 0) {
     const empty = document.createElement('li');
     empty.className = 'drafts-empty';
-    empty.textContent =
-      '下書きはありません。コメント可（緑）のノードから「下書きに追加」できます。';
+    empty.textContent = draftsBusy
+      ? 'GitHub の pending review を確認中…'
+      : '下書きはありません。コメント可（緑）のノードから「下書きに追加」すると、' +
+        'GitHub の pending review として保存されます（PR 画面からも見えます）。';
     draftsListEl.replaceChildren(empty);
   } else {
     draftsListEl.replaceChildren(...drafts.map(buildDraftItem));
   }
-  renderHandle?.setDraftMarks(new Set(drafts.map((d) => d.nodeId)));
+  renderHandle?.setDraftMarks(draftNodeIds(drafts, currentGraph?.nodes ?? []));
+}
+
+/** 下書きコメントに対応するグラフノードを探す（コメント可能行に一致するもの） */
+function nodeForComment(comment: PendingComment): GraphNode | undefined {
+  if (comment.line === null) return undefined;
+  return currentGraph?.nodes.find(
+    (n) =>
+      n.filePath === comment.path &&
+      comment.line !== null &&
+      n.commentableLines.includes(comment.line)
+  );
 }
 
 /** 下書き一覧の 1 行（ノード名 / path:line / 本文プレビュー / 編集 / 削除） */
-function buildDraftItem(draft: ReviewDraft): HTMLElement {
+function buildDraftItem(comment: PendingComment): HTMLElement {
   const item = document.createElement('li');
   item.className = 'draft-item';
 
+  const node = nodeForComment(comment);
+
   const name = document.createElement('span');
   name.className = 'draft-node-name';
-  name.textContent = draft.nodeName;
+  // GitHub の PR 画面で作られた下書きなど、グラフのノードに対応しないものもある
+  name.textContent = node?.name ?? '（グラフ外）';
 
+  const locText = `${comment.path}:L${comment.line ?? '?'}`;
   const loc = document.createElement('span');
   loc.className = 'draft-loc';
-  loc.textContent = `${draft.path}:L${draft.line}`;
-  loc.title = `${draft.path}:L${draft.line}`;
+  loc.textContent = locText;
+  loc.title = locText;
 
   const preview = document.createElement('span');
   preview.className = 'draft-preview';
-  preview.textContent = draft.body.replace(/\s+/g, ' ');
-  preview.title = draft.body;
+  preview.textContent = comment.body.replace(/\s+/g, ' ');
+  preview.title = comment.body;
 
   const edit = document.createElement('button');
   edit.className = 'draft-edit';
   edit.type = 'button';
   edit.textContent = '編集';
-  const node = currentGraph?.nodes.find((n) => n.id === draft.nodeId);
   if (node) {
     // 編集 = 対象ノードを選択してフォームに下書きをプリフィルする
     edit.addEventListener('click', () => selectNode(node));
   } else {
-    // 再解析（push 等で headSha が変わった）後のグラフに同じノードがない場合
     edit.disabled = true;
-    edit.title = '現在のグラフにこのノードが見つかりません（削除して作り直してください）';
+    edit.title =
+      'このコメントに対応するノードがグラフにありません（GitHub の PR 画面で編集できます）';
   }
 
   const del = document.createElement('button');
   del.className = 'draft-delete';
   del.type = 'button';
   del.textContent = '削除';
+  del.disabled = draftsBusy;
   del.addEventListener('click', () => {
-    drafts = removeDraft(drafts, draft.nodeId);
-    persistDrafts();
+    if (draftsBusy || !currentPr) return;
+    const message: DeletePendingCommentRequest = {
+      type: 'DELETE_PENDING_COMMENT',
+      pr: currentPr,
+      commentId: comment.id,
+    };
+    draftsBusy = true;
+    if (reviewStatusEl) {
+      reviewStatusEl.dataset.state = 'posting';
+      reviewStatusEl.textContent = '下書きを削除中…';
+    }
     renderDrafts();
-    // 対象ノードのフォームを開いていたらボタン表示（追加/更新・削除）を追従させる
-    commentUiUpdater?.();
+    void requestPendingMutation(message).then((result) => {
+      draftsBusy = false;
+      if (!panelHost) return;
+      if (reviewStatusEl) {
+        if (result.ok) {
+          delete reviewStatusEl.dataset.state;
+          reviewStatusEl.textContent = '';
+        } else {
+          reviewStatusEl.dataset.state = 'error';
+          reviewStatusEl.textContent = result.message;
+        }
+      }
+      renderDrafts();
+      // 対象ノードのフォームを開いていたらボタン表示（追加/更新・削除）を追従させる
+      commentUiUpdater?.();
+    });
   });
 
   item.append(name, loc, preview, edit, del);
@@ -1180,29 +1268,27 @@ function buildDraftItem(draft: ReviewDraft): HTMLElement {
 }
 
 /**
- * 溜めた下書きを 1 回の SUBMIT_REVIEW（POST /pulls/{n}/reviews）でまとめて送信する。
- * 成功時のみキューをクリアし、失敗時（422 で特定行が invalid 等）は下書きを残す
- * （ユーザーが修正して再送できる）。
+ * pending review を submit する（SUBMIT_PENDING_REVIEW = POST /reviews/{id}/events）。
+ * 成功すると下書きが PR の相手に見えるレビューになる。失敗時（push で行が
+ * outdated になった等の 422）は pending review が GitHub 側に残るので、
+ * ユーザーは下書きを直して再送できる。
  */
 function submitAllDrafts(): void {
-  if (submitting || drafts.length === 0 || !currentPr || !currentHeadSha) return;
-  if (!reviewStatusEl) return;
+  if (submitting || draftsBusy || drafts.length === 0 || !currentPr) return;
+  if (pendingReviewId === null || !reviewStatusEl) return;
+  const pr = currentPr;
+  const reviewId = pendingReviewId;
   submitting = true;
   reviewStatusEl.dataset.state = 'posting';
-  reviewStatusEl.textContent = `${drafts.length} 件のコメントを 1 つのレビューとして送信中…`;
+  reviewStatusEl.textContent = `${drafts.length} 件の下書きを 1 つのレビューとして送信中…`;
   renderDrafts();
-  void sendToBackground({
-    type: 'SUBMIT_REVIEW',
-    pr: currentPr,
-    commitId: currentHeadSha,
-    comments: drafts.map(({ path, line, body }) => ({ path, line, body })),
-  })
+  void sendToBackground({ type: 'SUBMIT_PENDING_REVIEW', pr, reviewId })
     .then((res) => {
       submitting = false;
       if (!reviewStatusEl) return; // パネルが閉じられた
       if (res.ok) {
+        pendingReviewId = null;
         drafts = [];
-        persistDrafts();
         reviewStatusEl.dataset.state = 'ok';
         reviewStatusEl.textContent = 'レビューを投稿しました: ';
         const link = document.createElement('a');
@@ -1228,30 +1314,78 @@ function submitAllDrafts(): void {
     });
 }
 
+/** background 応答の pending review 状態でローカル表示を丸ごと置き換える */
+function applyPendingState(value: PendingReviewPayload): void {
+  pendingReviewId = value.reviewId;
+  drafts = value.comments;
+}
+
 /**
- * chrome.storage.session から現在の PR の下書きを読み戻す。
- * session 領域は SW が setAccessLevel で開放するまで content から触れないため、
- * 失敗したら少し待って 1 回だけ再試行する（それでもダメなら空キューで開始）。
+ * pending review への変更要求（追加・更新・削除）を送り、成功なら応答の状態に同期する。
+ * 呼び出し側は draftsBusy の管理と表示更新（renderDrafts / commentUiUpdater）を行うこと。
  */
-async function loadDraftsFromSession(pr: PrRef): Promise<ReviewDraft[]> {
-  const key = draftStorageKey(pr);
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const items = await chrome.storage.session.get(key);
-      return parseDrafts(items[key]);
-    } catch {
-      if (attempt >= 1) return [];
-      await new Promise((resolve) => setTimeout(resolve, 300));
+async function requestPendingMutation(
+  message:
+    | AddPendingCommentRequest
+    | UpdatePendingCommentRequest
+    | DeletePendingCommentRequest
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  try {
+    const res = await sendToBackground(message);
+    if (res.ok) {
+      applyPendingState(res.value);
+      return { ok: true };
     }
+    return { ok: false, message: describeGithubError(res.error) };
+  } catch (e) {
+    return {
+      ok: false,
+      message: `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`,
+    };
   }
 }
 
-/** 下書きキューを chrome.storage.session に退避する（失敗しても送信フローには影響しない） */
-function persistDrafts(): void {
-  if (!currentPr) return;
-  void chrome.storage.session
-    .set({ [draftStorageKey(currentPr)]: drafts })
-    .catch(() => undefined);
+/**
+ * GitHub から現在の PR の pending review を取得して表示に反映する。
+ * パネルを開いたとき・PAT が設定されたときに呼ぶ。PAT 未設定時は background が
+ * 「pending review なし」を返すのでエラーにはならない。
+ */
+async function loadPendingReview(pr: PrRef): Promise<void> {
+  draftsBusy = true;
+  renderDrafts();
+  try {
+    const res = await sendToBackground({ type: 'GET_PENDING_REVIEW', pr });
+    // 取得中にパネルが閉じられた / 別 PR に移っていたら捨てる
+    if (!panelHost || currentPr !== pr) return;
+    if (res.ok) {
+      applyPendingState(res.value);
+      if (reviewStatusEl) {
+        delete reviewStatusEl.dataset.state;
+        reviewStatusEl.textContent = '';
+      }
+    } else if (reviewStatusEl) {
+      reviewStatusEl.dataset.state = 'error';
+      reviewStatusEl.textContent = `下書きの取得に失敗: ${describeGithubError(res.error)}`;
+    }
+  } catch (e) {
+    if (panelHost && currentPr === pr && reviewStatusEl) {
+      reviewStatusEl.dataset.state = 'error';
+      reviewStatusEl.textContent = `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  } finally {
+    if (panelHost && currentPr === pr) {
+      draftsBusy = false;
+      renderDrafts();
+      commentUiUpdater?.();
+      // 選択中ノードのフォームがあればプリフィル状態を追従させる。
+      // ただし入力中の本文があるときは作り直さない（書きかけを消さない）
+      const input =
+        panelHost.shadowRoot?.querySelector<HTMLTextAreaElement>('.comment-input');
+      if (selectedNode && (input?.value.trim() ?? '') === '') {
+        renderNodeDetail(selectedNode);
+      }
+    }
+  }
 }
 
 function renderSidePlaceholder(): void {
@@ -1341,19 +1475,21 @@ function renderNodeDetail(node: GraphNode): void {
 
 /**
  * コメント可能ノード用の下書きフォームを組み立てる。
- * - 「下書きに追加」は即送信しない（パネル下部のキューに溜まり、まとめて 1 レビューで送信）。
- *   PAT は送信時にだけ必要なので、追加ボタンの活性条件は「本文が空でない」だけ
+ * - 「下書きに追加」は GitHub の pending review に下書きコメントとして保存する
+ *   （PR の相手にはまだ見えない。送信はパネル下部の「n 件の下書きをレビューとして送信」）。
+ *   GitHub 側への保存なので、追加の時点から PAT が必要
  * - 対象行の表示（commentableLines が複数なら select で選択可能。既定は commentLine =
  *   関数範囲内の最初の追加行、なければ最初のコメント可能行）
- * - このノードの下書きが既にあれば本文・行をプリフィルし、「下書きを更新」「下書きを削除」になる
+ * - このノードの下書きが既にあれば本文・行をプリフィルし、「下書きを更新」「下書きを削除」になる。
+ *   行を変えた更新は PATCH でできないため、削除 → 追加し直しで実現する
  */
 function buildCommentForm(node: GraphNode): HTMLElement {
   const form = document.createElement('div');
   form.className = 'comment-form';
 
-  const existing = findDraft(drafts, node.id);
+  const existing = findCommentForNode(drafts, node);
   const defaultLine =
-    existing !== undefined && node.commentableLines.includes(existing.line)
+    existing?.line != null && node.commentableLines.includes(existing.line)
       ? existing.line
       : (node.commentLine ?? node.commentableLines[0]);
   let selectedLine = defaultLine;
@@ -1387,7 +1523,7 @@ function buildCommentForm(node: GraphNode): HTMLElement {
   const input = document.createElement('textarea');
   input.className = 'comment-input';
   input.placeholder =
-    'この関数へのレビューコメント…（Markdown 可。まとめて送信するまで投稿されません）';
+    'この関数へのレビューコメント…（Markdown 可。GitHub の pending review に下書きとして保存されます）';
   if (existing) input.value = existing.body;
 
   const submit = document.createElement('button');
@@ -1399,49 +1535,121 @@ function buildCommentForm(node: GraphNode): HTMLElement {
   remove.type = 'button';
   remove.textContent = '下書きを削除';
 
+  // PAT 導線（下書きが GitHub 側に保存されるため、追加の時点から PAT が必要）
+  const auth = document.createElement('div');
+  auth.className = 'comment-auth';
+  const authText = document.createElement('span');
+  authText.textContent = '下書きの保存（pending review）には PAT が必要です。';
+  const openOptions = document.createElement('button');
+  openOptions.className = 'open-options';
+  openOptions.type = 'button';
+  openOptions.textContent = 'PAT を設定する';
+  openOptions.addEventListener('click', () => {
+    void sendToBackground({ type: 'OPEN_OPTIONS' });
+  });
+  auth.append(authText, openOptions);
+
   const status = document.createElement('p');
   status.className = 'comment-status';
 
   const update = (): void => {
-    const hasDraft = findDraft(drafts, node.id) !== undefined;
+    const hasDraft = findCommentForNode(drafts, node) !== undefined;
     submit.textContent = hasDraft ? '下書きを更新' : '下書きに追加';
-    submit.disabled = input.value.trim() === '';
+    submit.disabled = input.value.trim() === '' || !patConfigured || draftsBusy;
     remove.hidden = !hasDraft;
+    remove.disabled = draftsBusy;
+    auth.dataset.visible = patConfigured ? 'false' : 'true';
   };
   input.addEventListener('input', update);
 
   submit.addEventListener('click', () => {
     const body = input.value.trim();
-    if (body === '') return;
-    const wasUpdate = findDraft(drafts, node.id) !== undefined;
-    drafts = upsertDraft(drafts, {
-      nodeId: node.id,
-      nodeName: node.name,
-      path: node.filePath,
-      line: selectedLine,
-      body,
-    });
-    persistDrafts();
-    renderDrafts();
-    status.dataset.state = 'ok';
-    status.textContent = wasUpdate
-      ? '下書きを更新しました（まだ送信されていません）'
-      : '下書きに追加しました（まだ送信されていません）';
+    if (body === '' || draftsBusy || !patConfigured) return;
+    if (!currentPr || !currentHeadSha) return;
+    const pr = currentPr;
+    const commitId = currentHeadSha;
+    const current = findCommentForNode(drafts, node);
+    draftsBusy = true;
+    status.dataset.state = 'posting';
+    status.textContent = current ? '下書きを更新中…' : '下書きを追加中…';
     update();
+    renderDrafts();
+    void (async () => {
+      let result: { ok: true } | { ok: false; message: string };
+      if (current && current.line === selectedLine) {
+        result = await requestPendingMutation({
+          type: 'UPDATE_PENDING_COMMENT',
+          pr,
+          commentId: current.id,
+          body,
+        });
+      } else {
+        // 行の変更は PATCH でできないため、旧コメントを消してから追加し直す
+        result = current
+          ? await requestPendingMutation({
+              type: 'DELETE_PENDING_COMMENT',
+              pr,
+              commentId: current.id,
+            })
+          : { ok: true };
+        if (result.ok) {
+          result = await requestPendingMutation({
+            type: 'ADD_PENDING_COMMENT',
+            pr,
+            commitId,
+            path: node.filePath,
+            line: selectedLine,
+            body,
+          });
+        }
+      }
+      draftsBusy = false;
+      if (!panelHost) return;
+      if (result.ok) {
+        status.dataset.state = 'ok';
+        status.textContent = current
+          ? '下書きを更新しました（GitHub の pending review・まだ送信されていません）'
+          : '下書きを追加しました（GitHub の pending review・まだ送信されていません）';
+      } else {
+        status.dataset.state = 'error';
+        status.textContent = result.message;
+      }
+      renderDrafts();
+      update();
+    })();
   });
 
   remove.addEventListener('click', () => {
-    drafts = removeDraft(drafts, node.id);
-    persistDrafts();
-    renderDrafts();
-    delete status.dataset.state;
-    status.textContent = '下書きを削除しました';
+    const current = findCommentForNode(drafts, node);
+    if (!current || draftsBusy || !currentPr) return;
+    const pr = currentPr;
+    draftsBusy = true;
+    status.dataset.state = 'posting';
+    status.textContent = '下書きを削除中…';
     update();
+    renderDrafts();
+    void requestPendingMutation({
+      type: 'DELETE_PENDING_COMMENT',
+      pr,
+      commentId: current.id,
+    }).then((result) => {
+      draftsBusy = false;
+      if (!panelHost) return;
+      if (result.ok) {
+        delete status.dataset.state;
+        status.textContent = '下書きを削除しました';
+      } else {
+        status.dataset.state = 'error';
+        status.textContent = result.message;
+      }
+      renderDrafts();
+      update();
+    });
   });
 
   commentUiUpdater = update;
   update();
-  form.append(target, input, submit, remove, status);
+  form.append(target, input, submit, remove, auth, status);
   return form;
 }
 
@@ -1482,7 +1690,7 @@ async function renderGraph(): Promise<void> {
     if (token !== renderToken || !panelHost) return;
     renderHandle = handle;
     if (selectedNode) handle.setSelected(selectedNode.id);
-    handle.setDraftMarks(new Set(drafts.map((d) => d.nodeId)));
+    handle.setDraftMarks(draftNodeIds(drafts, filtered.nodes));
     // フィルタ切り替え等の再描画でも現在の倍率を維持する
     handle.setZoom(zoomLevel);
   } catch (e) {
@@ -1532,28 +1740,20 @@ function openPanel(): void {
   currentHeadSha = null;
   renderHandle = null;
   zoomLevel = 1;
+  pendingReviewId = null;
   drafts = [];
+  draftsBusy = false;
   submitting = false;
-  // まとめて送信ボタンの活性条件。以後の変更は storage.onChanged が追従する
+  // 送信ボタン・下書き追加の活性条件。以後の変更は storage.onChanged が追従する
+  const pr = currentPr;
   void getPat().then((pat) => {
     patConfigured = pat !== null;
     commentUiUpdater?.();
     renderDrafts();
+    // 下書きは GitHub の pending review が正。パネルを開くたびに取得する
+    // （PR 画面で作った下書きも拾える。PAT 未設定なら「なし」が返るだけ）
+    if (panelHost && currentPr === pr) void loadPendingReview(pr);
   });
-  // 下書きキューを chrome.storage.session から復元する（SPA 遷移・開き直しでも残る）。
-  // PING で SW を先に起こす = session 領域の setAccessLevel（SW 起動時に実行）を確実にする
-  const pr = currentPr;
-  void sendToBackground({ type: 'PING', pr })
-    .catch(() => undefined)
-    .then(() => loadDraftsFromSession(pr))
-    .then((loaded) => {
-      // 読み戻し中にパネルが閉じられた / 別 PR に移っていたら捨てる
-      if (!panelHost || currentPr !== pr) return;
-      drafts = loaded;
-      renderDrafts();
-      // 選択中ノードのフォームがあればプリフィル状態を追従させる
-      if (selectedNode) renderNodeDetail(selectedNode);
-    });
   panelHost = buildPanel();
   // トグルボタンを覆ってしまわないよう、パネルはボタンの下端から開く
   const button = document.getElementById(BUTTON_ID);
@@ -1578,6 +1778,7 @@ function closePanel(): void {
   nodeCountEl = null;
   draftsListEl = null;
   draftsCountEl = null;
+  draftsRefreshEl = null;
   reviewSubmitEl = null;
   reviewStatusEl = null;
   draftsAuthEl = null;
@@ -1588,8 +1789,10 @@ function closePanel(): void {
   zoomLevel = 1;
   zoomUiUpdater = null;
   commentUiUpdater = null;
-  // drafts は chrome.storage.session に退避済み。次に開いたとき復元される
+  // 下書きは GitHub の pending review に保存済み。次に開いたとき取得し直す
+  pendingReviewId = null;
   drafts = [];
+  draftsBusy = false;
   submitting = false;
   renderToken++;
 }

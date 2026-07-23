@@ -5,10 +5,9 @@ import type {
   AuthTestPayload,
   FileContentPayload,
   GithubResult,
+  PendingReviewPayload,
   PrFilesPayload,
   PrInfo,
-  ReviewCommentInput,
-  ReviewCommentPayload,
   ReviewSubmitPayload,
 } from './github';
 import type { GraphPayload } from './graph';
@@ -65,12 +64,24 @@ export interface BuildGraphRequest {
 }
 
 /**
- * PR にレビューコメントを投稿する（Phase 5）。
+ * 現在の PR の pending review（GitHub ネイティブの下書きレビュー）を取得する。
+ * pending review は認証ユーザー本人にしか見えないため、PAT 未設定時はエラーではなく
+ * 「pending review なし」（reviewId: null, comments: []）の ok 応答が返る。
+ */
+export interface GetPendingReviewRequest {
+  type: 'GET_PENDING_REVIEW';
+  pr: PrRef;
+}
+
+/**
+ * pending review に下書きコメントを 1 件追加する。pending review が無ければ
+ * POST /pulls/{n}/reviews（event なし = PENDING）でレビューごと作成し、あれば
+ * GraphQL の addPullRequestReviewThread で追記する。応答は更新後の pending review 全体。
  * line は patch の RIGHT サイド（head）に含まれる行であること（GraphNode.commentableLines）。
  * PAT 未設定時は kind: 'pat_required' のエラーが返る（UI 側のボタン無効化と二重防御）。
  */
-export interface PostReviewCommentRequest {
-  type: 'POST_REVIEW_COMMENT';
+export interface AddPendingCommentRequest {
+  type: 'ADD_PENDING_COMMENT';
   pr: PrRef;
   /** コメントを紐づけるコミット SHA（解析に使った headSha） */
   commitId: string;
@@ -83,17 +94,40 @@ export interface PostReviewCommentRequest {
 }
 
 /**
- * 溜めた下書きを 1 つのレビューとしてまとめて投稿する（batch-review-comments）。
- * POST /pulls/{n}/reviews に event: 'COMMENT' で全コメントを載せ、API 呼び出しは 1 回。
- * PAT 未設定時は kind: 'pat_required' のエラーが返る（UI 側のボタン無効化と二重防御）。
+ * pending review 上の下書きコメントの本文を更新する（GraphQL
+ * updatePullRequestReviewComment。pending コメントは REST から触れない）。
+ * 行の変更はできない（呼び出し側で削除 → 追加し直す）。応答は更新後の pending review 全体。
  */
-export interface SubmitReviewRequest {
-  type: 'SUBMIT_REVIEW';
+export interface UpdatePendingCommentRequest {
+  type: 'UPDATE_PENDING_COMMENT';
   pr: PrRef;
-  /** コメントを紐づけるコミット SHA（解析に使った headSha） */
-  commitId: string;
-  /** インラインコメント（各行は patch の RIGHT サイドに含まれること） */
-  comments: ReviewCommentInput[];
+  /** 対象コメントの GraphQL ノード ID */
+  commentId: string;
+  /** 新しいコメント本文（Markdown） */
+  body: string;
+}
+
+/**
+ * pending review 上の下書きコメントを削除する（GraphQL deletePullRequestReviewComment）。
+ * 最後の 1 件を消したときは空になった pending review 自体も削除する。
+ * 応答は更新後の pending review 全体。
+ */
+export interface DeletePendingCommentRequest {
+  type: 'DELETE_PENDING_COMMENT';
+  pr: PrRef;
+  /** 対象コメントの GraphQL ノード ID */
+  commentId: string;
+}
+
+/**
+ * pending review を event: COMMENT で submit する（GraphQL submitPullRequestReview）。
+ * これで初めて下書きが PR の相手に見える状態になる。approve / request changes にはならない。
+ */
+export interface SubmitPendingReviewRequest {
+  type: 'SUBMIT_PENDING_REVIEW';
+  pr: PrRef;
+  /** pending review の GraphQL ノード ID */
+  reviewId: string;
 }
 
 /** PAT の有効性確認。PAT があれば GET /user、なければ GET /rate_limit */
@@ -113,8 +147,11 @@ export type RequestMessage =
   | GetPrFilesRequest
   | GetFileContentRequest
   | BuildGraphRequest
-  | PostReviewCommentRequest
-  | SubmitReviewRequest
+  | GetPendingReviewRequest
+  | AddPendingCommentRequest
+  | UpdatePendingCommentRequest
+  | DeletePendingCommentRequest
+  | SubmitPendingReviewRequest
   | TestAuthRequest
   | OpenOptionsRequest;
 
@@ -129,9 +166,13 @@ export type ResponseFor<M extends RequestMessage> = M extends PingRequest
         ? GithubResult<FileContentPayload>
         : M extends BuildGraphRequest
           ? GithubResult<GraphPayload>
-          : M extends PostReviewCommentRequest
-            ? GithubResult<ReviewCommentPayload>
-            : M extends SubmitReviewRequest
+          : M extends
+                | GetPendingReviewRequest
+                | AddPendingCommentRequest
+                | UpdatePendingCommentRequest
+                | DeletePendingCommentRequest
+            ? GithubResult<PendingReviewPayload>
+            : M extends SubmitPendingReviewRequest
               ? GithubResult<ReviewSubmitPayload>
               : M extends TestAuthRequest
                 ? GithubResult<AuthTestPayload>
