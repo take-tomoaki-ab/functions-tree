@@ -3,7 +3,9 @@
 // （文法 wasm の追加は package.json の copy-wasm と analyzer.ts の grammars にも 1 行ずつ）。
 
 import type { Node, Query } from 'web-tree-sitter';
+import type { HighlightToken } from '../../shared/graph';
 import type { LanguageMetadata } from '../../shared/languages';
+import type { HighlightConfig } from '../highlight';
 
 /** 関数本体内の呼び出し 1 つ */
 export interface CallSite {
@@ -26,9 +28,17 @@ export interface FunctionInfo {
   /** 1 始まりの行範囲（宣言全体。デコレータ含む） */
   startLine: number;
   endLine: number;
+  /**
+   * ファイル先頭からの文字オフセット範囲（sourceText の切り出し位置。UTF-16 単位）。
+   * analyzer-core がハイライトトークンを関数ごとに割り当てるのに使う
+   */
+  startIndex: number;
+  endIndex: number;
   /** 他ファイルから参照できる場合の公開名 */
   exportName?: string;
   sourceText: string;
+  /** sourceText 内のハイライトトークン（analyze 後に analyzer-core が付与する） */
+  highlights?: HighlightToken[];
   calls: CallSite[];
 }
 
@@ -97,6 +107,8 @@ export interface LanguageDefinition extends LanguageMetadata {
   grammarKeyFor(path: string): string;
   functionsQuery: string;
   importsQuery: string;
+  /** sourceText のシンタックスハイライト設定（highlight.ts の共通走査が参照する） */
+  highlight: HighlightConfig;
   /** クエリ結果 + 構文木から FileAnalysis を組み立てる */
   analyze(path: string, rootNode: Node, queries: LanguageQueries): FileAnalysis;
   /**

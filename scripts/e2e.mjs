@@ -30,6 +30,9 @@
 // - ダミー PAT 保存 → 送信ボタンが自動活性化し、まとめて送信で 401 が人間可読で表示され、
 //   下書きが消えない（実 PR への投稿はされない。無効 PAT のため GitHub 側で拒否される）
 //
+// feat/syntax-highlight で追加した確認項目:
+// - ノード詳細のソースがシンタックスハイライトされる（.source code 内に tok-* の span）
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -264,6 +267,12 @@ try {
         name: (shadow?.querySelector('.detail-name')?.textContent ?? '').trim(),
         meta: (shadow?.querySelector('.detail-meta')?.textContent ?? '').trim(),
         sourceLength: (shadow?.querySelector('.source code')?.textContent ?? '').length,
+        // シンタックスハイライトの span（種別の内訳も検証ログに出す）
+        tokenKinds: [
+          ...[...(shadow?.querySelectorAll('.source code [class^="tok-"]') ?? [])]
+            .reduce((acc, s) => acc.set(s.className, (acc.get(s.className) ?? 0) + 1), new Map())
+            .entries(),
+        ],
         selectedCount: shadow?.querySelectorAll('.graph-area g.node.selected').length ?? 0,
         commentTarget: (shadow?.querySelector('.comment-target')?.textContent ?? '').trim(),
         hasCommentInput: !!shadow?.querySelector('.comment-input'),
@@ -328,6 +337,11 @@ try {
       (detail.hasCommentInput || detail.disabledReason !== '') &&
       detail.selectedCount === 1,
     `name=${detail.name} meta=${detail.meta} sourceLen=${detail.sourceLength} selected=${detail.selectedCount}`
+  );
+  record(
+    'node detail: source is syntax highlighted (tok-* spans)',
+    detail.tokenKinds.reduce((n, [, c]) => n + c, 0) > 0,
+    `kinds=${JSON.stringify(detail.tokenKinds)}`
   );
   await shot(page, '4-node-detail-source');
 

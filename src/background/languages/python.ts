@@ -16,6 +16,7 @@
 
 import type { Node } from 'web-tree-sitter';
 import { languageMetadata } from '../../shared/languages';
+import type { HighlightConfig } from '../highlight';
 import type {
   DependencyTarget,
   FileAnalysis,
@@ -37,6 +38,30 @@ const IMPORTS_QUERY = `
 (import_statement) @import
 (import_from_statement) @import
 `;
+
+const HIGHLIGHT: HighlightConfig = {
+  wholeNodeTypes: {
+    comment: 'comment',
+    // 型注釈（`name: str` の str 等）。識別子の入れ子ごと type で塗る
+    type: 'type',
+  },
+  leafTypes: {
+    // f-string の interpolation を素通しするため、string は whole にせず葉で塗る
+    string_start: 'string',
+    string_content: 'string',
+    string_end: 'string',
+    escape_sequence: 'string',
+    integer: 'number',
+    float: 'number',
+    true: 'constant',
+    false: 'constant',
+    none: 'constant',
+  },
+  functionDefTypes: ['function_definition'],
+  typeDefTypes: ['class_definition'],
+  calls: [{ type: 'call', field: 'function' }],
+  member: { type: 'attribute', field: 'attribute' },
+};
 
 function isFunctionBoundary(node: Node): boolean {
   // lambda は境界にせず外側の関数に帰属させる
@@ -171,6 +196,7 @@ export const pythonLanguage: LanguageDefinition = {
   grammarKeyFor: () => 'python',
   functionsQuery: FUNCTIONS_QUERY,
   importsQuery: IMPORTS_QUERY,
+  highlight: HIGHLIGHT,
   isFunctionBoundary,
 
   analyze(path: string, rootNode: Node, queries: LanguageQueries): FileAnalysis {
@@ -194,6 +220,8 @@ export const pythonLanguage: LanguageDefinition = {
         isMethod,
         startLine: rangeNode.startPosition.row + 1,
         endLine: rangeNode.endPosition.row + 1,
+        startIndex: rangeNode.startIndex,
+        endIndex: rangeNode.endIndex,
         // トップレベルの def は他モジュールから import 可能
         exportName: isTopLevel ? bare : undefined,
         sourceText: rangeNode.text,

@@ -1,6 +1,24 @@
 // コールグラフの共有型。background の analyzer が生成し、content の panel が描画する。
 // Phase 4 の mermaid 描画・Phase 5 のコメント可否判定（inDiff）もこの型を使う。
 
+/** シンタックスハイライトのトークン種別（panel 側の CSS クラス `tok-<kind>` に対応） */
+export type HighlightKind =
+  | 'keyword'
+  | 'string'
+  | 'comment'
+  | 'number'
+  | 'constant'
+  | 'function'
+  | 'type';
+
+/**
+ * sourceText 内のハイライト範囲。[開始オフセット, 終了オフセット, 種別]。
+ * オフセットは sourceText 先頭からの UTF-16 コードユニット単位（String#slice にそのまま使える）。
+ * 昇順・重複なし。トークン間の隙間は無装飾テキストとして描画する。
+ * グラフ全ノード分をメッセージで運ぶため、オブジェクトではなくタプルで持つ。
+ */
+export type HighlightToken = [start: number, end: number, kind: HighlightKind];
+
 /** グラフのノード = 関数 1 つ */
 export interface GraphNode {
   /** `${filePath}#${name}@${startLine}` 形式の一意 ID */
@@ -31,6 +49,8 @@ export interface GraphNode {
   commentLine?: number;
   /** 関数定義のソーステキスト（Phase 4 のサイドパネル表示用） */
   sourceText: string;
+  /** sourceText のシンタックスハイライト（tree-sitter の構文木から抽出） */
+  highlightTokens: HighlightToken[];
 }
 
 /** グラフのエッジ = 関数から関数への呼び出し */

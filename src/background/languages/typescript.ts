@@ -3,6 +3,7 @@
 
 import type { Node } from 'web-tree-sitter';
 import { languageMetadata } from '../../shared/languages';
+import type { HighlightConfig } from '../highlight';
 import type {
   DependencyTarget,
   FileAnalysis,
@@ -28,6 +29,42 @@ const FUNCTIONS_QUERY = `
 const IMPORTS_QUERY = `
 (import_statement source: (string (string_fragment) @source)) @import
 `;
+
+const HIGHLIGHT: HighlightConfig = {
+  wholeNodeTypes: {
+    comment: 'comment',
+    regex: 'string',
+    // `string` / `number` 等の anonymous キーワードを含むため全体を type で塗る
+    predefined_type: 'type',
+  },
+  leafTypes: {
+    // 引用符と内容が別トークンなので、どちらも string で塗る
+    // （template_string は substitution を素通しするため whole にしない）
+    string_fragment: 'string',
+    escape_sequence: 'string',
+    '"': 'string',
+    "'": 'string',
+    '`': 'string',
+    number: 'number',
+    type_identifier: 'type',
+    this: 'keyword',
+    super: 'keyword',
+    true: 'constant',
+    false: 'constant',
+    null: 'constant',
+    undefined: 'constant',
+  },
+  functionDefTypes: [
+    'function_declaration',
+    'generator_function_declaration',
+    'method_definition',
+  ],
+  calls: [
+    { type: 'call_expression', field: 'function' },
+    { type: 'new_expression', field: 'constructor' },
+  ],
+  member: { type: 'member_expression', field: 'property' },
+};
 
 function isFunctionBoundary(node: Node): boolean {
   if (node.type === 'function_declaration' || node.type === 'method_definition') {
@@ -157,6 +194,7 @@ export const typescriptLanguage: LanguageDefinition = {
     path.endsWith('.tsx') || path.endsWith('.jsx') ? 'tsx' : 'typescript',
   functionsQuery: FUNCTIONS_QUERY,
   importsQuery: IMPORTS_QUERY,
+  highlight: HIGHLIGHT,
   isFunctionBoundary,
 
   analyze(path: string, rootNode: Node, queries: LanguageQueries): FileAnalysis {
@@ -182,6 +220,8 @@ export const typescriptLanguage: LanguageDefinition = {
         isMethod: funcNode.type === 'method_definition',
         startLine: rangeNode.startPosition.row + 1,
         endLine: rangeNode.endPosition.row + 1,
+        startIndex: rangeNode.startIndex,
+        endIndex: rangeNode.endIndex,
         exportName: directExportName(funcNode, name) ?? exportClauses.get(name),
         sourceText: rangeNode.text,
         calls: collectCalls(bodyRoot, ['call_expression'], isFunctionBoundary),

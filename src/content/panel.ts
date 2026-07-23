@@ -5,7 +5,7 @@
 // 初回描画時に動的 import する（content.js 自体は軽いまま）。
 
 import { describeGithubError } from '../shared/github';
-import type { FunctionGraph, GraphNode } from '../shared/graph';
+import type { FunctionGraph, GraphNode, HighlightToken } from '../shared/graph';
 import type { PrRef } from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
 import type { ReviewDraft } from '../shared/review-drafts';
@@ -273,6 +273,23 @@ const PANEL_CSS = `
   font-size: 11px;
   line-height: 1.45;
   white-space: pre;
+}
+/* シンタックスハイライト（GitHub のライト / ダーク配色に合わせる） */
+.source .tok-keyword { color: #cf222e; }
+.source .tok-string { color: #0a3069; }
+.source .tok-comment { color: #59636e; }
+.source .tok-number { color: #0550ae; }
+.source .tok-constant { color: #0550ae; }
+.source .tok-function { color: #8250df; }
+.source .tok-type { color: #953800; }
+@media (prefers-color-scheme: dark) {
+  .source .tok-keyword { color: #ff7b72; }
+  .source .tok-string { color: #a5d6ff; }
+  .source .tok-comment { color: #9198a1; }
+  .source .tok-number { color: #79c0ff; }
+  .source .tok-constant { color: #79c0ff; }
+  .source .tok-function { color: #d2a8ff; }
+  .source .tok-type { color: #ffa657; }
 }
 .comment-label {
   display: block;
@@ -1094,6 +1111,30 @@ function renderSidePlaceholder(): void {
   sidePaneEl.replaceChildren(p);
 }
 
+/**
+ * sourceText をハイライトトークンに沿って span に分割し code 要素へ流し込む。
+ * トークン間の隙間（識別子・記号・空白）は無装飾のテキストノードで出す。
+ * innerHTML は使わない（sourceText はリポジトリ由来の任意文字列）。
+ */
+function renderHighlightedSource(
+  code: HTMLElement,
+  text: string,
+  tokens: HighlightToken[]
+): void {
+  let pos = 0;
+  for (const [start, end, kind] of tokens) {
+    // 範囲外・逆順のトークンは無視して残りを素のテキストで出す（描画を壊さない）
+    if (start < pos || end > text.length || start >= end) continue;
+    if (start > pos) code.append(text.slice(pos, start));
+    const span = document.createElement('span');
+    span.className = `tok-${kind}`;
+    span.textContent = text.slice(start, end);
+    code.appendChild(span);
+    pos = end;
+  }
+  if (pos < text.length) code.append(text.slice(pos));
+}
+
 /** サイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）を描画する */
 function renderNodeDetail(node: GraphNode): void {
   if (!sidePaneEl) return;
@@ -1122,7 +1163,7 @@ function renderNodeDetail(node: GraphNode): void {
   const source = document.createElement('pre');
   source.className = 'source';
   const code = document.createElement('code');
-  code.textContent = node.sourceText;
+  renderHighlightedSource(code, node.sourceText, node.highlightTokens ?? []);
   source.appendChild(code);
 
   const commentArea = document.createElement('div');
