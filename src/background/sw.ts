@@ -45,7 +45,9 @@ chrome.runtime.onMessage.addListener(
         return true;
       }
       case 'BUILD_GRAPH': {
-        void buildGraphForPr(message.pr).then(sendResponse);
+        void buildGraphForPr(message.pr, { forceRefresh: message.forceRefresh }).then(
+          sendResponse
+        );
         return true;
       }
       case 'GET_PENDING_REVIEW': {

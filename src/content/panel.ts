@@ -93,6 +93,24 @@ const PANEL_CSS = `
 .close-button:hover {
   background: rgba(140, 149, 159, 0.2);
 }
+.graph-refresh {
+  margin-left: 12px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 400;
+  border: 1px solid rgba(140, 149, 159, 0.5);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.graph-refresh:hover:enabled {
+  background: rgba(140, 149, 159, 0.2);
+}
+.graph-refresh:disabled {
+  color: #59636e;
+  cursor: not-allowed;
+}
 .toolbar {
   display: flex;
   align-items: center;
@@ -663,6 +681,8 @@ const PANEL_CSS = `
 `;
 
 let panelHost: HTMLElement | null = null;
+let graphRefreshEl: HTMLButtonElement | null = null;
+let graphBusy = false;
 let statusEl: HTMLElement | null = null;
 let authNoticeEl: HTMLElement | null = null;
 let graphAreaEl: HTMLElement | null = null;
@@ -1011,6 +1031,16 @@ function buildPanel(): HTMLElement {
   header.className = 'panel-header';
   const title = document.createElement('span');
   title.textContent = '関数依存グラフ';
+  // キャッシュヒット時も明示的に再解析できる導線（issue #13: 更新ボタンに相当）
+  graphRefreshEl = document.createElement('button');
+  graphRefreshEl.className = 'graph-refresh';
+  graphRefreshEl.type = 'button';
+  graphRefreshEl.textContent = '再解析';
+  graphRefreshEl.title = 'キャッシュを使わずに解析し直す';
+  graphRefreshEl.addEventListener('click', () => {
+    if (graphBusy || !currentPr) return;
+    void loadGraph(currentPr, { forceRefresh: true });
+  });
   const close = document.createElement('button');
   close.className = 'close-button';
   close.type = 'button';
@@ -1018,7 +1048,7 @@ function buildPanel(): HTMLElement {
   close.title = '閉じる（Esc）';
   close.textContent = '✕';
   close.addEventListener('click', closePanel);
-  header.append(title, close);
+  header.append(title, graphRefreshEl, close);
 
   const toolbar = document.createElement('div');
   toolbar.className = 'toolbar';
@@ -1700,12 +1730,18 @@ async function renderGraph(): Promise<void> {
   }
 }
 
-async function loadGraph(pr: PrRef): Promise<void> {
+async function loadGraph(pr: PrRef, opts: { forceRefresh?: boolean } = {}): Promise<void> {
   if (!statusEl) return;
+  graphBusy = true;
+  if (graphRefreshEl) graphRefreshEl.disabled = true;
   delete statusEl.dataset.state;
-  statusEl.textContent = 'コールグラフを解析中…';
+  statusEl.textContent = opts.forceRefresh ? 'コールグラフを再解析中…' : 'コールグラフを解析中…';
   try {
-    const res = await sendToBackground({ type: 'BUILD_GRAPH', pr });
+    const res = await sendToBackground({
+      type: 'BUILD_GRAPH',
+      pr,
+      forceRefresh: opts.forceRefresh,
+    });
     // パネルが閉じられていたら描画しない
     if (!statusEl || !authNoticeEl || !panelHost) return;
     authNoticeEl.dataset.visible = res.authMode === 'anonymous' ? 'true' : 'false';
@@ -1728,6 +1764,9 @@ async function loadGraph(pr: PrRef): Promise<void> {
     if (!statusEl) return;
     statusEl.dataset.state = 'error';
     statusEl.textContent = `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    graphBusy = false;
+    if (graphRefreshEl) graphRefreshEl.disabled = false;
   }
 }
 
@@ -1739,6 +1778,7 @@ function openPanel(): void {
   currentGraph = null;
   currentHeadSha = null;
   renderHandle = null;
+  graphBusy = false;
   zoomLevel = 1;
   pendingReviewId = null;
   drafts = [];
@@ -1770,6 +1810,7 @@ function closePanel(): void {
   document.removeEventListener('keydown', handleEscapeKeydown, true);
   panelHost?.remove();
   panelHost = null;
+  graphRefreshEl = null;
   statusEl = null;
   authNoticeEl = null;
   graphAreaEl = null;
