@@ -7,6 +7,7 @@ import { describe, test } from 'node:test';
 
 import {
   commentableLinesForRange,
+  deletedLinesForRange,
   parsePatchCommentableLines,
 } from '../dist-test/diff-lines.mjs';
 
@@ -91,7 +92,109 @@ describe('parsePatchCommentableLines', () => {
       const r = parsePatchCommentableLines(patch);
       assert.deepEqual(r.commentable, []);
       assert.deepEqual(r.added, []);
+      assert.deepEqual(r.deleted, []);
     }
+  });
+});
+
+// 削除行は RIGHT に行番号を持たないので「次に来る RIGHT 行の直前」として位置を持つ。
+// パネルのソース表示で git diff と同じ「削除 → 追加」の並びを再現するための情報。
+describe('parsePatchCommentableLines: 削除行', () => {
+  test('置換 hunk: 削除行は追加行と同じ RIGHT 行を beforeLine に持つ', () => {
+    const patch = [
+      '@@ -10,3 +10,3 @@',
+      ' keep10',
+      '-old11',
+      '+new11',
+      ' keep12',
+    ].join('\n');
+    const r = parsePatchCommentableLines(patch);
+    assert.deepEqual(r.deleted, [{ beforeLine: 11, text: 'old11' }]);
+    assert.deepEqual(r.added, [11]);
+  });
+
+  test('連続削除: 内容と順序が保たれ、beforeLine は同じ行になる', () => {
+    const patch = ['@@ -1,4 +1,2 @@', ' a', '-b', '-c', ' d'].join('\n');
+    const r = parsePatchCommentableLines(patch);
+    assert.deepEqual(r.deleted, [
+      { beforeLine: 2, text: 'b' },
+      { beforeLine: 2, text: 'c' },
+    ]);
+    assert.deepEqual(r.added, []);
+  });
+
+  test('hunk 冒頭の削除: beforeLine は hunk の開始行', () => {
+    const patch = ['@@ -1,3 +1,2 @@', '-gone', ' keep1', ' keep2'].join('\n');
+    const r = parsePatchCommentableLines(patch);
+    assert.deepEqual(r.deleted, [{ beforeLine: 1, text: 'gone' }]);
+  });
+
+  test('複数 hunk: それぞれの RIGHT 開始行から数え直す', () => {
+    const patch = [
+      '@@ -1,2 +1,1 @@',
+      ' a',
+      '-b',
+      '@@ -30,2 +29,1 @@',
+      '-p',
+      ' q',
+    ].join('\n');
+    const r = parsePatchCommentableLines(patch);
+    assert.deepEqual(r.deleted, [
+      { beforeLine: 2, text: 'b' },
+      { beforeLine: 29, text: 'p' },
+    ]);
+  });
+
+  test('先頭の "-" を除いた内容が入る（空の削除行 / インデント保持）', () => {
+    const patch = ['@@ -1,3 +1,1 @@', ' a', '-', '-    indented'].join('\n');
+    const r = parsePatchCommentableLines(patch);
+    assert.deepEqual(r.deleted, [
+      { beforeLine: 2, text: '' },
+      { beforeLine: 2, text: '    indented' },
+    ]);
+  });
+
+  test('diff ヘッダの "--- a/file" を削除行と誤認しない（hunk 外は無視）', () => {
+    const patch = ['--- a/x.ts', '+++ b/x.ts', '@@ -1,1 +1,1 @@', ' a'].join('\n');
+    const r = parsePatchCommentableLines(patch);
+    assert.deepEqual(r.deleted, []);
+    assert.deepEqual(r.added, []);
+  });
+});
+
+describe('deletedLinesForRange', () => {
+  const info = parsePatchCommentableLines(
+    [
+      '@@ -8,11 +8,7 @@',
+      ' c8',
+      '-del9',
+      ' c9',
+      ' c10',
+      '-del11',
+      '-del12',
+      ' c11',
+      ' c12',
+      ' c13',
+      ' c14',
+      '-del15',
+    ].join('\n')
+  );
+
+  test('beforeLine が範囲内の削除行だけを返す', () => {
+    assert.deepEqual(deletedLinesForRange(info, 10, 12), [
+      { beforeLine: 11, text: 'del11' },
+      { beforeLine: 11, text: 'del12' },
+    ]);
+  });
+
+  test('範囲の両端を含む', () => {
+    assert.deepEqual(deletedLinesForRange(info, 9, 9), [
+      { beforeLine: 9, text: 'del9' },
+    ]);
+  });
+
+  test('範囲外なら空（隣の関数の削除行を拾わない）', () => {
+    assert.deepEqual(deletedLinesForRange(info, 12, 14), []);
   });
 });
 
@@ -99,23 +202,27 @@ describe('commentableLinesForRange', () => {
   const info = {
     commentable: [10, 11, 12, 13, 14, 30, 31],
     added: [12, 13, 31],
+    deleted: [],
   };
 
   test('範囲内のコメント可能行を返し、推奨行は最初の追加行', () => {
     const r = commentableLinesForRange(info, 11, 14);
     assert.deepEqual(r.lines, [11, 12, 13, 14]);
+    assert.deepEqual(r.added, [12, 13], '範囲内の追加行だけを返す');
     assert.equal(r.commentLine, 12);
   });
 
   test('範囲内に追加行がなければ最初のコメント可能行（文脈行）にフォールバック', () => {
     const r = commentableLinesForRange(info, 10, 11);
     assert.deepEqual(r.lines, [10, 11]);
+    assert.deepEqual(r.added, []);
     assert.equal(r.commentLine, 10);
   });
 
   test('範囲と重なる行がなければ lines は空で commentLine は undefined', () => {
     const r = commentableLinesForRange(info, 20, 25);
     assert.deepEqual(r.lines, []);
+    assert.deepEqual(r.added, []);
     assert.equal(r.commentLine, undefined);
   });
 
