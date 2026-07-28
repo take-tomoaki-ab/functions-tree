@@ -140,17 +140,45 @@ export interface LanguageDefinition extends LanguageMetadata {
 // 言語共通ヘルパ
 // ---------------------------------------------------------------------------
 
+/**
+ * 呼び出しとみなすノードの指定。ノード種別だけを文字列で書くと
+ * callee は 'function' フィールドから取る（通常の関数呼び出し）。
+ */
+export interface CallNodeSpec {
+  /** 呼び出しに相当するノード種別 */
+  type: string;
+  /** callee のテキストを持つフィールド名（既定 'function'） */
+  field?: string;
+  /**
+   * その callee を呼び出しとして扱うか。省略時はすべて採用。
+   * JSX の組み込み要素（`<div>`）のように、構文上は同じ形でも
+   * 関数参照ではないものを弾くのに使う。
+   */
+  accepts?(callee: string): boolean;
+}
+
+export type CallNodePattern = string | CallNodeSpec;
+
 /** 呼び出しノードを boundary を跨がずに集める */
 export function collectCalls(
   root: Node,
-  callNodeTypes: readonly string[],
+  callNodes: readonly CallNodePattern[],
   isBoundary: (node: Node) => boolean
 ): CallSite[] {
+  const specs = new Map<string, CallNodeSpec>(
+    callNodes.map((c) => {
+      const spec = typeof c === 'string' ? { type: c } : c;
+      return [spec.type, spec];
+    })
+  );
   const calls: CallSite[] = [];
   const visit = (node: Node): void => {
-    if (callNodeTypes.includes(node.type)) {
-      const fn = node.childForFieldName('function');
-      if (fn) calls.push({ callee: fn.text, line: fn.startPosition.row + 1 });
+    const spec = specs.get(node.type);
+    if (spec) {
+      const callee = node.childForFieldName(spec.field ?? 'function');
+      if (callee && (!spec.accepts || spec.accepts(callee.text))) {
+        calls.push({ callee: callee.text, line: callee.startPosition.row + 1 });
+      }
     }
     for (const child of node.namedChildren) {
       if (child && !isBoundary(child)) visit(child);
