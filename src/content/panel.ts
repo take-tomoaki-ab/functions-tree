@@ -14,7 +14,7 @@ import type {
   UpdatePendingCommentRequest,
 } from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
-import { getSourcePaneHeight, setSourcePaneHeight } from '../shared/panel-prefs';
+import { getSidePaneWidth, setSidePaneWidth } from '../shared/panel-prefs';
 import { draftNodeIds, findCommentForNode } from '../shared/review-drafts';
 import { getPat, PAT_KEY } from '../shared/settings';
 import type { GraphFilter } from './mermaid-source';
@@ -305,12 +305,38 @@ const PANEL_CSS = `
   stroke-width: 3px !important;
   stroke-dasharray: none !important;
 }
+.splitter {
+  position: relative;
+  flex-shrink: 0;
+  width: 9px;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+}
+.splitter::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: rgba(140, 149, 159, 0.3);
+}
+.splitter:hover::after,
+.splitter[data-dragging="true"]::after {
+  background: #0969da;
+}
+@media (prefers-color-scheme: dark) {
+  .splitter::after { background: #3d444d; }
+  .splitter:hover::after,
+  .splitter[data-dragging="true"]::after { background: #4493f8; }
+}
 .side-pane {
   width: 320px;
+  min-width: 200px;
   flex-shrink: 0;
   overflow-y: auto;
   padding: 12px;
-  border-left: 1px solid rgba(140, 149, 159, 0.3);
   font-size: 12px;
 }
 .side-placeholder {
@@ -344,12 +370,8 @@ const PANEL_CSS = `
 .source {
   margin: 0 0 12px;
   padding: 8px;
-  box-sizing: border-box;
-  height: 45%;
-  min-height: 80px;
-  max-height: 70vh;
+  max-height: 45%;
   overflow: auto;
-  resize: vertical;
   background: rgba(140, 149, 159, 0.1);
   border: 1px solid rgba(140, 149, 159, 0.3);
   border-radius: 6px;
@@ -770,12 +792,13 @@ let currentGraph: FunctionGraph | null = null;
 let currentHeadSha: string | null = null;
 let selectedNode: GraphNode | null = null;
 let renderHandle: RenderHandle | null = null;
-// コード表示エリアの高さ（ユーザーがドラッグでリサイズした値、px）。
-// パネルを開いたときに storage から読み、ノード選択のたびに再生成される
-// .source 要素へ適用する。ユーザーがリサイズしたら debounce して保存する
-let sourcePaneHeightPx: number | null = null;
-let sourceResizeObserver: ResizeObserver | null = null;
-let sourceResizeSaveTimer: number | null = null;
+// パネル内のグラフ領域とサイドペインの間の区切りバー、およびその親コンテナ
+let mainEl: HTMLElement | null = null;
+let splitterEl: HTMLElement | null = null;
+// サイドペインの幅（ユーザーがドラッグでリサイズした値、px）。
+// パネルを開いたときに storage から読み、buildPanel でサイドペインへ適用する。
+// ユーザーがリサイズしたらドラッグ終了時に保存する
+let sidePaneWidthPx: number | null = null;
 // グラフの表示倍率（1 = 実寸）。フィルタ切り替えの再描画でも維持し、
 // パネルを開き直したら 1 に戻す
 let zoomLevel = 1;
@@ -1180,12 +1203,80 @@ function buildPanel(): HTMLElement {
   graphAreaEl.append(graphCanvasEl, buildZoomControls());
   sidePaneEl = document.createElement('div');
   sidePaneEl.className = 'side-pane';
-  main.append(graphAreaEl, sidePaneEl);
+  if (sidePaneWidthPx !== null) {
+    sidePaneEl.style.width = `${sidePaneWidthPx}px`;
+  }
+  mainEl = main;
+  splitterEl = buildSplitter();
+  main.append(graphAreaEl, splitterEl, sidePaneEl);
   renderSidePlaceholder();
 
   panel.append(header, toolbar, authNoticeEl, statusEl, main, buildDraftsPane());
   shadow.appendChild(panel);
   return host;
+}
+
+// サイドペインが潰れて使い物にならない／グラフ領域が潰れて何も見えなくなるのを防ぐ下限
+const MIN_SIDE_PANE_WIDTH_PX = 200;
+const MIN_GRAPH_AREA_WIDTH_PX = 200;
+// .splitter の width（CSS）と一致させる。ドラッグ可能な最大幅の計算に使う
+const SPLITTER_WIDTH_PX = 9;
+
+/** サイドペイン幅を、グラフ領域側の最小幅を確保しつつ [MIN, main幅から逆算した上限] に丸める */
+function clampSidePaneWidth(widthPx: number, mainWidthPx: number): number {
+  const maxWidth = Math.max(
+    MIN_SIDE_PANE_WIDTH_PX,
+    mainWidthPx - MIN_GRAPH_AREA_WIDTH_PX - SPLITTER_WIDTH_PX
+  );
+  return Math.min(Math.max(widthPx, MIN_SIDE_PANE_WIDTH_PX), maxWidth);
+}
+
+/**
+ * グラフ領域とサイドペインの間のドラッグ可能な区切りバー。
+ * pointer capture を使うことで、ドラッグ中にポインタが要素の外へ出ても
+ * pointermove/up を確実にこのバーで受け取れるようにする。
+ */
+function buildSplitter(): HTMLElement {
+  const splitter = document.createElement('div');
+  splitter.className = 'splitter';
+  splitter.setAttribute('role', 'separator');
+  splitter.setAttribute('aria-orientation', 'vertical');
+  splitter.setAttribute('aria-label', 'グラフとサイドペインの境界');
+  splitter.addEventListener('pointerdown', (e: PointerEvent) => {
+    if (e.button !== 0 || !sidePaneEl || !mainEl) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidePaneEl.getBoundingClientRect().width;
+    const mainWidthPx = mainEl.getBoundingClientRect().width;
+    splitter.setPointerCapture(e.pointerId);
+    splitter.dataset.dragging = 'true';
+    // ドラッグ中はテキスト選択を無効化し、カーソルを col-resize に固定する
+    // （ポインタが splitter の外に出ても見た目が変わらないよう document 全体へ適用）
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (!sidePaneEl || !mainEl) return;
+      const delta = moveEvent.clientX - startX;
+      // サイドペインは右側固定なので、左へドラッグ（delta < 0）すると幅が増える
+      const nextWidth = clampSidePaneWidth(startWidth - delta, mainWidthPx);
+      sidePaneEl.style.width = `${nextWidth}px`;
+      sidePaneWidthPx = nextWidth;
+    };
+    const onUp = () => {
+      splitter.removeEventListener('pointermove', onMove);
+      splitter.removeEventListener('pointerup', onUp);
+      splitter.removeEventListener('pointercancel', onUp);
+      delete splitter.dataset.dragging;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      if (sidePaneWidthPx !== null) void setSidePaneWidth(sidePaneWidthPx);
+    };
+    splitter.addEventListener('pointermove', onMove);
+    splitter.addEventListener('pointerup', onUp);
+    splitter.addEventListener('pointercancel', onUp);
+  });
+  return splitter;
 }
 
 /** パネル下部の下書き一覧ペイン（件数バッジ / 一覧 / まとめて送信）を組み立てる */
@@ -1562,32 +1653,6 @@ function renderHighlightedSource(
   if (pos < text.length) code.append(text.slice(pos));
 }
 
-/**
- * コード表示エリア（.source）の高さをユーザーがドラッグでリサイズしたら記憶する。
- * observe 開始直後に飛んでくる初回のコールバックは初期レイアウトの通知であり
- * ユーザー操作ではないため無視する（そうしないとノード選択のたびに初期値で上書きされる）。
- */
-function observeSourceResize(source: HTMLElement): void {
-  sourceResizeObserver?.disconnect();
-  let firstCallback = true;
-  sourceResizeObserver = new ResizeObserver(() => {
-    if (firstCallback) {
-      firstCallback = false;
-      return;
-    }
-    // border-box（box-sizing: border-box）で読む。ResizeObserver の contentRect は
-    // content-box のため、そのまま style.height（border-box）に書き戻すとズレる
-    const height = Math.round(source.getBoundingClientRect().height);
-    if (height <= 0) return;
-    sourcePaneHeightPx = height;
-    if (sourceResizeSaveTimer !== null) window.clearTimeout(sourceResizeSaveTimer);
-    sourceResizeSaveTimer = window.setTimeout(() => {
-      void setSourcePaneHeight(height);
-    }, 300);
-  });
-  sourceResizeObserver.observe(source);
-}
-
 /** サイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）を描画する */
 function renderNodeDetail(node: GraphNode): void {
   if (!sidePaneEl) return;
@@ -1619,13 +1684,9 @@ function renderNodeDetail(node: GraphNode): void {
 
   const source = document.createElement('pre');
   source.className = 'source';
-  if (sourcePaneHeightPx !== null) {
-    source.style.height = `${sourcePaneHeightPx}px`;
-  }
   const code = document.createElement('code');
   renderSourceRows(code, rows);
   source.appendChild(code);
-  observeSourceResize(source);
 
   const commentArea = document.createElement('div');
   commentArea.className = 'comment-area';
@@ -1939,10 +2000,11 @@ function openPanel(): void {
     // （PR 画面で作った下書きも拾える。PAT 未設定なら「なし」が返るだけ）
     if (panelHost && currentPr === pr) void loadPendingReview(pr);
   });
-  // 前回リサイズしたコード表示エリアの高さを復元する
-  // （storage 読み込みが .source 生成より遅れても、以後のノード選択から反映される）
-  void getSourcePaneHeight().then((height) => {
-    sourcePaneHeightPx = height;
+  // 前回リサイズしたサイドペインの幅を復元する
+  // （storage 読み込みが buildPanel より遅れても、読み込み完了時に直接反映する）
+  void getSidePaneWidth().then((width) => {
+    sidePaneWidthPx = width;
+    if (sidePaneEl && width !== null) sidePaneEl.style.width = `${width}px`;
   });
   panelHost = buildPanel();
   // トグルボタンを覆ってしまわないよう、パネルはボタンの下端から開く
@@ -1966,6 +2028,8 @@ function closePanel(): void {
   graphAreaEl = null;
   graphCanvasEl = null;
   sidePaneEl = null;
+  mainEl = null;
+  splitterEl = null;
   nodeCountEl = null;
   draftsListEl = null;
   draftsCountEl = null;
@@ -1980,12 +2044,6 @@ function closePanel(): void {
   zoomLevel = 1;
   zoomUiUpdater = null;
   commentUiUpdater = null;
-  sourceResizeObserver?.disconnect();
-  sourceResizeObserver = null;
-  if (sourceResizeSaveTimer !== null) {
-    window.clearTimeout(sourceResizeSaveTimer);
-    sourceResizeSaveTimer = null;
-  }
   // 下書きは GitHub の pending review に保存済み。次に開いたとき取得し直す
   pendingReviewId = null;
   drafts = [];

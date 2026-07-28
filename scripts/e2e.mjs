@@ -61,9 +61,9 @@
 //   キャッシュがヒットすること（旧実装の SW メモリの Map は SW 再起動で必ず消えていた）
 //
 // feat/issue-14-resizable-code-area で追加した確認項目:
-// - コード表示エリア（.source）が右下ハンドルのドラッグでリサイズできる
-//   （CSS resize: vertical）
-// - リサイズした高さが chrome.storage.local に保存され、パネルを閉じて
+// - パネル内のグラフ領域とサイドペインの間に区切りバー（.splitter）があり、
+//   ドラッグでサイドペインの幅を変えられる（pointerdown/move/up + pointer capture）
+// - リサイズした幅が chrome.storage.local に保存され、パネルを閉じて
 //   開き直しても復元される
 //
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
@@ -480,34 +480,42 @@ try {
   );
   await shot(page, '4-node-detail-source');
 
-  // 5a. コード表示エリア（.source）は右下ハンドルでリサイズできること（issue #14）。
-  //     ブラウザネイティブの CSS resize: vertical によるハンドルを実際にドラッグする
-  const readSourceRect = () =>
+  // 5a. グラフ領域とサイドペインの間の区切りバー（.splitter）をドラッグすると
+  //     サイドペインの幅が変わること（issue #14 作り直し版）
+  const readSidePaneRect = () =>
     page.evaluate(() => {
       const el = document
         .querySelector('#functions-tree-panel-host')
-        ?.shadowRoot?.querySelector('.source');
+        ?.shadowRoot?.querySelector('.side-pane');
       const r = el?.getBoundingClientRect();
-      return r ? { width: r.width, height: r.height, right: r.right, bottom: r.bottom } : null;
+      return r ? { width: r.width } : null;
     });
-  const sourceRectBefore = await readSourceRect();
-  let sourceRectAfter = null;
-  if (sourceRectBefore) {
-    const handleX = sourceRectBefore.right - 6;
-    const handleY = sourceRectBefore.bottom - 6;
-    await page.mouse.move(handleX, handleY);
+  const readSplitterCenter = () =>
+    page.evaluate(() => {
+      const el = document
+        .querySelector('#functions-tree-panel-host')
+        ?.shadowRoot?.querySelector('.splitter');
+      const r = el?.getBoundingClientRect();
+      return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+    });
+  const sidePaneRectBefore = await readSidePaneRect();
+  const splitterCenter = await readSplitterCenter();
+  let sidePaneRectAfter = null;
+  if (sidePaneRectBefore && splitterCenter) {
+    await page.mouse.move(splitterCenter.x, splitterCenter.y);
     await page.mouse.down();
-    await page.mouse.move(handleX, handleY + 100, { steps: 10 });
+    // サイドペインは右側固定なので、左へドラッグすると幅が増える
+    await page.mouse.move(splitterCenter.x - 80, splitterCenter.y, { steps: 10 });
     await page.mouse.up();
-    sourceRectAfter = await readSourceRect();
+    sidePaneRectAfter = await readSidePaneRect();
     record(
-      'source pane: drag handle resizes code area height',
-      !!sourceRectAfter && sourceRectAfter.height > sourceRectBefore.height + 30,
-      `before=${sourceRectBefore.height} after=${sourceRectAfter?.height}`
+      'splitter: dragging left increases side pane width',
+      !!sidePaneRectAfter && sidePaneRectAfter.width > sidePaneRectBefore.width + 30,
+      `before=${sidePaneRectBefore.width} after=${sidePaneRectAfter?.width}`
     );
-    await shot(page, '4b-source-resized');
+    await shot(page, '4b-splitter-resized');
   } else {
-    record('source pane: drag handle resizes code area height', false, '.source not found');
+    record('splitter: dragging left increases side pane width', false, '.splitter or .side-pane not found');
   }
 
   // 6. フィルタトグル OFF（エッジのあるノードのみ → 全ノード）で表示が増えること
@@ -754,17 +762,17 @@ try {
   );
   await shot(page, '6c-panel-graph-cache-survives-sw-restart');
 
-  // 7d. リサイズしたコード表示エリアの高さが記憶され、パネルを閉じて開き直しても
-  //     （chrome.storage.local への保存を経由して）復元されること（issue #14）
+  // 7d. リサイズしたサイドペイン幅が記憶され、パネルを閉じて開き直しても
+  //     （chrome.storage.local への保存を経由して）復元されること（issue #14 作り直し版）
   await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
-  const sourceRectRestored = await readSourceRect();
+  const sidePaneRectRestored = await readSidePaneRect();
   record(
-    'source pane: resized height is remembered across panel reopen',
-    !!sourceRectAfter && !!sourceRectRestored &&
-      Math.abs(sourceRectRestored.height - sourceRectAfter.height) <= 2,
-    `resized=${sourceRectAfter?.height} restored=${sourceRectRestored?.height}`
+    'splitter: resized side pane width is remembered across panel reopen',
+    !!sidePaneRectAfter && !!sidePaneRectRestored &&
+      Math.abs(sidePaneRectRestored.width - sidePaneRectAfter.width) <= 2,
+    `resized=${sidePaneRectAfter?.width} restored=${sidePaneRectRestored?.width}`
   );
-  await shot(page, '6d-source-height-restored');
+  await shot(page, '6d-side-pane-width-restored');
 
   // 8. 再度押下でパネルが閉じること
   await page.locator(BUTTON).click();
