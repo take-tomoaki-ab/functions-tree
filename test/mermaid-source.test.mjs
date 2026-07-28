@@ -25,15 +25,25 @@ function node(name, filePath, startLine, inDiff, extra = {}) {
     kind: 'function_declaration',
     inDiff,
     commentableLines: [],
+    hasChangedLine: false,
     sourceText: `function ${name}() {}`,
     ...extra,
   };
 }
 
-// a はコメント可（diff の行あり）、c は変更ファイル内だが関数無変更、b / isolated は diff 外
-const a = node('alpha', 'src/a.ts', 1, true, { commentableLines: [2, 3], commentLine: 2 });
+// a はコメント可（変更あり）、c は変更ファイル内で関数無変更だが diff コンテキスト内で
+// コメント可能（issue #10: 黄色ノードもコメント可能であるべき）、b / isolated は diff 外
+const a = node('alpha', 'src/a.ts', 1, true, {
+  commentableLines: [2, 3],
+  commentLine: 2,
+  hasChangedLine: true,
+});
 const b = node('beta', 'src/b.ts', 10, false);
-const c = node('gamma', 'src/a.ts', 20, true);
+const c = node('gamma', 'src/a.ts', 20, true, {
+  commentableLines: [21],
+  commentLine: 21,
+  hasChangedLine: false,
+});
 const isolated = node('lonely', 'src/c.ts', 5, false);
 
 const graph = {
@@ -73,10 +83,23 @@ describe('buildMermaidSource', () => {
     assert.match(source, new RegExp(`classDef ${NODE_CLASS_DEPENDENCY} `));
   });
 
-  test('nodeClassOf: コメント可 > 変更ファイル内 > 依存先 の優先で分類する', () => {
+  test('nodeClassOf: 変更あり(緑) > 差分なしだがコメント可(黄) > コメント不可(グレー) の優先で分類する', () => {
     assert.equal(nodeClassOf(a), NODE_CLASS_COMMENTABLE);
     assert.equal(nodeClassOf(c), NODE_CLASS_IN_DIFF);
     assert.equal(nodeClassOf(b), NODE_CLASS_DEPENDENCY);
+  });
+
+  test('nodeClassOf: 黄色（差分なしだがコメント可能）ノードは commentableLines が非空（issue #10 回帰）', () => {
+    assert.equal(nodeClassOf(c), NODE_CLASS_IN_DIFF);
+    assert.ok(c.commentableLines.length > 0, '黄色ノードはコメント可能でなければならない');
+  });
+
+  test('nodeClassOf: 変更ファイル内でも hunk に一切掛からない関数はコメント不可のグレー扱い', () => {
+    const untouched = node('delta', 'src/a.ts', 100, true, {
+      commentableLines: [],
+      hasChangedLine: false,
+    });
+    assert.equal(nodeClassOf(untouched), NODE_CLASS_DEPENDENCY);
   });
 
   test('ラベルの特殊文字（" < > &）は実体参照にエスケープされる', () => {

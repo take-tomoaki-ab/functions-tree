@@ -43,6 +43,10 @@
 // - Ctrl/Cmd + ホイールでもズームできる（カーソル位置基準）
 // - リセットで 100%（基準サイズ）に戻る
 //
+// bugfix/issue-10-yellow-node-comment で追加した確認項目:
+// - 黄色ノード（差分はないが diff コンテキスト内でコメント可能）に実際にコメント
+//   フォームが出ること（本当にコメント不可なのは .dep クラスのノードだけ）
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -498,15 +502,17 @@ try {
   // 後始末: 入力を空に戻す（以降のコメント欄確認に影響させない）
   await page.locator('#functions-tree-panel-host .comment-input').fill('');
 
-  // 6.5. コメント不可ノード（diff 外 / 関数無変更）で理由が表示されること
+  // 6.5. コメント不可ノード（diff 外 / hunk に一切掛からない）で理由が表示されること
+  //      .commentable と .inDiff（差分なしだがコメント可）はどちらも投稿可能なので、
+  //      「本当にコメント不可」なのは .dep クラスのノードだけ（issue #10 の修正後の分類）
   const nonCommentable = page.locator(
-    '#functions-tree-panel-host .graph-area g.node:not(.commentable)'
+    '#functions-tree-panel-host .graph-area g.node.dep'
   );
   if ((await nonCommentable.count()) > 0) {
     await nonCommentable.first().click();
     const ncDetail = await readDetail();
     record(
-      'non-commentable node: reason shown, no comment form',
+      'non-commentable node (gray): reason shown, no comment form',
       (ncDetail.disabledReason.includes('関数は変更されていません') ||
         ncDetail.disabledReason.includes('diff 外のためコメント不可')) &&
         !ncDetail.hasCommentInput,
@@ -514,8 +520,32 @@ try {
     );
     await shot(page, '5c-non-commentable-reason');
   } else {
-    record('non-commentable node: reason shown, no comment form', false,
+    record('non-commentable node (gray): reason shown, no comment form', false,
       'この PR には コメント不可ノードがない（別の PR で確認要）');
+  }
+
+  // 6.6. issue #10 回帰: 黄色ノード（差分なしだがコメント可能）は実際にコメントフォームが
+  //      出ること（disabled 理由ではなく対象行が表示される）
+  const inDiffOnly = page.locator(
+    '#functions-tree-panel-host .graph-area g.node.inDiff'
+  );
+  if ((await inDiffOnly.count()) > 0) {
+    await inDiffOnly.first().click();
+    const yDetail = await readDetail();
+    record(
+      'issue #10 regression: yellow node (no diff, in diff context) is commentable',
+      yDetail.hasCommentInput && yDetail.commentTarget.includes('にコメントされます') &&
+        yDetail.disabledReason === '',
+      `hasCommentInput=${yDetail.hasCommentInput} target="${yDetail.commentTarget}" ` +
+        `disabledReason="${yDetail.disabledReason}"`
+    );
+    await shot(page, '5d-indiff-node-commentable');
+  } else {
+    record(
+      'issue #10 regression: yellow node (no diff, in diff context) is commentable',
+      false,
+      'この PR には黄色（差分なしだがコメント可能）ノードがない（別の PR で確認要）'
+    );
   }
 
   // 7. 閉じて開き直すと SW メモリキャッシュから返ること（レート制限を消費しない）
