@@ -11,14 +11,16 @@ functions-tree は変更ファイルとその依存先を tree-sitter（WASM）�
 
 ## 主な機能
 
-- **コールグラフ表示**：mermaid（flowchart）で描画。コメント可否で 3 区分に色分けする（コメント可 = 緑、変更ファイル内だが関数は無変更 = 黄、diff 外の依存先 = グレー破線）。「エッジのあるノードのみ」「変更ファイル内のみ」のフィルタつき
-- **関数詳細**：ノードクリックでサイドペインに関数名、パスと行範囲、ソース全文を表示。ソースは解析に使った tree-sitter の構文木からシンタックスハイライトされる（ハイライトライブラリは不使用）
+- **コールグラフ表示**：mermaid（flowchart）で描画。コメント可否で 3 区分に色分けする（コメント可・変更あり = 緑、コメント可・差分なし（hunk の文脈行内） = 黄、コメント不可・diff 外 = グレー破線）。「エッジのあるノードのみ」「変更ファイル内のみ」のフィルタつき
+- **関数詳細**：ノードクリックでサイドペインに関数名、パスと行範囲、ソースを git diff 風の行単位ビューで表示する（行番号ガター、+/- マーカー、追加行は緑・削除行は赤の背景、関数名の横に `+n -m` の変更行数バッジ）。ソースは解析に使った tree-sitter の構文木からシンタックスハイライトされる（ハイライトライブラリは不使用）
 - **レビューコメントの一括投稿**：ノードごとにコメントを「下書きに追加」すると GitHub ネイティブの pending review に下書きとして保存され、「n 件の下書きをレビューとして送信」で 1 つのレビュー（インラインコメント群）として投稿する。下書きは GitHub 側に保存されるため、PR 画面（Files changed の pending コメント）からも確認・編集でき、ブラウザを閉じても消えない。PR 画面で作った下書きもパネルの一覧に表示される
+- **解析結果のキャッシュ**：`owner/repo#pr@headSha` 単位で `chrome.storage.session` に永続化され、MV3 の service worker が再起動してもキャッシュヒットする。パネルヘッダーの「再解析」ボタンでキャッシュを無視して強制的に再計算できる
+- **リサイズ可能なレイアウト**：グラフ領域とサイドペインの間のスプリッターをドラッグして幅を調整できる。幅は `chrome.storage.local` に保存され、パネルを開き直しても復元される
 - **多言語対応**：TypeScript / JavaScript、Go、Python
 
 | 言語 | 拡張子 | 解決できる呼び出し |
 |---|---|---|
-| TypeScript / JavaScript | .ts .tsx .js .jsx .mjs .cjs | 同一ファイル、相対 import（named / alias / namespace / default）、`this.method()` |
+| TypeScript / JavaScript | .ts .tsx .js .jsx .mjs .cjs | 同一ファイル、相対 import（named / alias / namespace / default）、`this.method()`、JSX の関数コンポーネント呼び出し（`<Component />` / `<UI.Panel />`。小文字始まりの組み込み要素は除外、閉じタグは二重計上しない） |
 | Go | .go | 同一パッケージ（ディレクトリ内の兄弟ファイルを自動展開）、go.mod の module パス基準のパッケージ import |
 | Python | .py | 同一ファイル、相対 import と絶対 import（src レイアウト推定つき、標準ライブラリは除外）、`self.method()` |
 
@@ -64,7 +66,7 @@ UI は Shadow DOM に隔離し、GitHub 側の CSS やキーボードショー�
 
 1. PR ページでパネルを開くと、background が `GET /pulls/{n}/files` で変更ファイル一覧を取得する
 2. 変更ファイルと、相対 import 等で辿れる深さ 1 の依存ファイルを `GET /contents` で取得し、tree-sitter でパースして関数、呼び出し、import を抽出する
-3. 呼び出しを import 情報と突き合わせてコールグラフ（JSON）を組み立て、`owner/repo#pr@headSha` キーで service worker のメモリにキャッシュする
+3. 呼び出しを import 情報と突き合わせてコールグラフ（JSON）を組み立て、`owner/repo#pr@headSha` キーで `chrome.storage.session` にキャッシュする（SW の再起動・サスペンドをまたいでも有効。パネルの「再解析」ボタンでキャッシュを無視して強制再計算できる）
 4. あわせて各ファイルの patch から「コメント可能な行集合」を作り、関数の行範囲と突き合わせて行レベルのコメント可否を判定する
 5. content script がグラフを mermaid 記法に変換して描画する
 6. 下書きは GitHub ネイティブの pending review に統合されている。「下書きに追加」は pending review が無ければ `POST /pulls/{n}/reviews`（`event` なし = PENDING）で作成し、あれば GraphQL の `addPullRequestReviewThread` で追記する。pending 状態のコメントは REST API からは見えない（一覧が空になり PATCH / DELETE も効かない）ため、取得は GraphQL の `reviews(states: PENDING)`、編集・削除・投稿も GraphQL（`updatePullRequestReviewComment` / `deletePullRequestReviewComment` / `submitPullRequestReview`）で行う
@@ -86,26 +88,38 @@ manifest の CSP には tree-sitter WASM の実行に必須の `wasm-unsafe-eval
 
 ### ユニットテスト
 
-解析コア（`analyzer-core.ts` と `languages/`）、diff 行マッピング（`diff-lines.ts`）、mermaid 記法変換（`mermaid-source.ts`）、pending review まわりのロジック（`review-drafts.ts`）は GitHub API に依存しない純粋ロジックとして分離してあり、`test/fixtures*/` の小さなプロジェクトに対して Node 上で検証する（レート制限を消費しない）。
+解析コア（`analyzer-core.ts` と `languages/`）、diff 行マッピング（`diff-lines.ts`）、解析結果キャッシュの判定（`graph-cache.ts`）、mermaid 記法変換（`mermaid-source.ts`）、ズーム倍率計算（`zoom.ts`）、ソースの diff 行分解（`source-diff.ts`）、pending review まわりのロジック（`review-drafts.ts`）は GitHub API や `chrome.storage` に依存しない純粋ロジックとして分離してあり、`test/fixtures*/` の小さなプロジェクトに対して Node 上で検証する（レート制限を消費しない）。
 
 ```sh
 npm test               # esbuild でコアをバンドル → node --test
 ```
 
+`src/content/*.ts` や `src/background/*.ts` に `chrome.storage` 等に依存しない純粋ロジックを新しく切り出したときは、`package.json` の `pretest` に esbuild でのバンドル行を追記すること（`chrome.storage` を直接使う非純粋モジュールは対象外）。
+
 ### 自動動作確認（E2E）
 
 branded Chrome 137+ は `--load-extension` を無視するため、Playwright の Chromium（open-source ビルド）に拡張をロードして実 PR ページで確認する。
 
+`npm run e2e` は `dist/` を自動リビルドしない（`pree2e` は無い）ため、ソースを変更した後は必ず `npm run build` を先に実行すること。
+
 ```sh
 npx playwright install chromium
+npm run build
 npm run e2e -- --repo honojs/hono --pr 5140
 ```
+
+`--pr` は明示的に指定すること。未指定だと PR 一覧の先頭を使うため、対応言語のファイルを含まない PR だとノード 0 件で無関係な失敗をする（`--repo` 省略時のデフォルトは `microsoft/TypeScript`）。
 
 ボタン注入、グラフ描画と色分け、ノードクリック、フィルタ、options の PAT 保存と削除、SPA 遷移への追従、下書き（pending review）まわりの PAT 必須ガードとエラー経路までを自動確認する。
 実 PR への下書き作成・レビュー投稿は行わない（無効 PAT での 401 経路までを確認する）。
 
-E2E は未認証レート制限（60 req/h、IP 単位）を消費する。
-`--repo gorilla/mux --pr 760`（Go、約 15 リクエスト）や `--repo pallets/flask --pr 6013`（Python、約 45 リクエスト）のように、対応言語のファイルを含む小さめの PR を指定するとよい。
+E2E は未認証レート制限（60 req/h、IP 単位）を消費する。用途別の推奨 PR:
+
+- `--repo honojs/hono --pr 4200`（追加行・削除行・文脈行が揃う）
+- `--repo honojs/hono --pr 5140`（新規関数のみ）
+- `--repo excalidraw/excalidraw --pr 11681`（tsx・JSX の関数コンポーネント依存の確認）
+- `--repo gorilla/mux --pr 760`（Go、約 15 リクエスト）
+- `--repo pallets/flask --pr 6013`（Python、約 45 リクエスト）
 
 ### ディレクトリ構成
 
@@ -115,18 +129,21 @@ src/
 ├── content/             # content script（github.com/* に注入、PR ページ判定はコード側）
 │   ├── index.ts         # エントリポイント
 │   ├── detector.ts      # PR ページ検出（turbo / popstate / ポーリングで SPA 遷移に追従）
-│   ├── panel.ts         # トグルボタン注入 + Shadow DOM パネル（グラフ + 詳細サイドペイン）
+│   ├── panel.ts         # トグルボタン注入 + Shadow DOM パネル（グラフ + 詳細サイドペイン + リサイズ可能なスプリッター）
 │   ├── mermaid-source.ts# グラフ JSON → mermaid 記法変換 + 表示フィルタ（純粋ロジック）
-│   └── mermaid-view.ts  # GraphRenderer インターフェース + mermaid 実装（別バンドルで遅延ロード）
+│   ├── mermaid-view.ts  # GraphRenderer インターフェース + mermaid 実装（別バンドルで遅延ロード）
+│   ├── source-diff.ts   # ソース全文 → git diff 風の行単位ビュー（純粋ロジック）
+│   └── zoom.ts          # mermaid グラフのズーム倍率計算（純粋ロジック）
 ├── background/
 │   ├── sw.ts            # service worker（メッセージハンドラ）
 │   ├── github-api.ts    # GitHub REST API クライアント
 │   ├── analyzer-core.ts # コールグラフ組み立ての言語非依存コア
 │   ├── languages/       # 言語定義（typescript / go / python。追加は index.ts の登録簿へ）
 │   ├── diff-lines.ts    # patch → コメント可能行集合の純粋ロジック
-│   └── analyzer.ts      # SW 統合（GitHub API 配線 + headSha キーのメモリキャッシュ）
+│   ├── graph-cache.ts   # キャッシュヒット判定（headSha 一致 / forceRefresh）の純粋ロジック
+│   └── analyzer.ts      # SW 統合（GitHub API 配線 + headSha キーの chrome.storage.session キャッシュ）
 ├── options/             # PAT の設定ページ + 対応言語の一覧表示
-└── shared/              # メッセージ型、グラフ型、pending review ロジック、設定などの共有コード
+└── shared/              # メッセージ型、グラフ型、pending review ロジック、設定、サイドペイン幅などの共有コード
 test/                    # 上記純粋ロジックのテスト + fixtures*/（TS / Go / Python の小プロジェクト）
 scripts/e2e.mjs          # Playwright Chromium での自動動作確認
 ```

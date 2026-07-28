@@ -36,9 +36,19 @@ npm test
 
 ユニットテストがパスしたら、E2E テストも必ず実行する。
 
+`npm run e2e` は `dist/` を自動リビルドしない（`pree2e` は無い）ため、ソースに変更を加えた場合は
+**必ず `npm run build` を先に実行してから** `npm run e2e` を実行すること。
+`--repo` / `--pr` は明示的に指定する（`--` を忘れずに）。未指定だと PR 一覧の先頭が使われ、
+対応言語のファイルを含まない PR だとノード 0 件で無関係な失敗をする。
+
 ```bash
-npm run e2e
+npm run build
+npm run e2e -- --repo honojs/hono --pr 4200
 ```
+
+用途別の推奨 PR は README.md の「自動動作確認（E2E）」を参照（追加/削除/文脈行が揃う hono#4200、
+新規関数のみの hono#5140、tsx・JSX 依存確認の excalidraw#11681 など）。
+E2E は未認証で GitHub API を叩くためレート制限 60 req/h を消費する。
 
 - E2E が失敗した場合も同様に、原因を修正して全件パスするまで先へ進まない。
 - E2E 実行時のスクリーンショットは必ず `screenshots/` ディレクトリに出力する
