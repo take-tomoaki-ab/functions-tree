@@ -342,6 +342,79 @@ describe('buildGraph: グラフ組み立て', () => {
   });
 });
 
+// issue #12: `<Component />` という JSX での関数コンポーネント呼び出しが
+// 依存として扱われていなかった（call_expression しか拾っていなかった）
+describe('JSX: 関数コンポーネントの呼び出し', () => {
+  test('自己閉じ / 開始終了ペア / メンバー形式を呼び出しとして拾う', async () => {
+    const content = (await fetchFixture('page.tsx')).content;
+    const a = analyzer.analyzeFile('page.tsx', content);
+
+    const page = a.functions.find((f) => f.name === 'Page');
+    const callees = page.calls.map((c) => c.callee);
+    assert.ok(callees.includes('Layout'), '<Layout>...</Layout>');
+    assert.ok(callees.includes('UI.Panel'), '<UI.Panel />');
+    assert.ok(callees.includes('Card'), '<Card>...</Card>');
+    assert.ok(callees.includes('CardTitle'), '<CardTitle />');
+    assert.ok(callees.includes('toUpper'), '通常の関数呼び出しも引き続き拾う');
+  });
+
+  test('終了タグは二重に数えない（<Card>...</Card> は 2 回の参照で 2 件）', async () => {
+    const content = (await fetchFixture('page.tsx')).content;
+    const a = analyzer.analyzeFile('page.tsx', content);
+    const callees = a.functions.find((f) => f.name === 'Page').calls;
+    // <Card>...</Card> と .map 内の <Card /> で 2 件（終了タグを数えれば 3 件になる）
+    assert.equal(callees.filter((c) => c.callee === 'Card').length, 2);
+    assert.equal(callees.filter((c) => c.callee === 'Layout').length, 1);
+  });
+
+  test('組み込み要素・Fragment・名前空間タグは呼び出しにしない', async () => {
+    const content = (await fetchFixture('page.tsx')).content;
+    const a = analyzer.analyzeFile('page.tsx', content);
+    const callees = a.functions.find((f) => f.name === 'Page').calls.map((c) => c.callee);
+    for (const intrinsic of ['div', 'main', 'section', 'h2', 'h3']) {
+      assert.ok(!callees.includes(intrinsic), `組み込み要素 ${intrinsic} は対象外`);
+    }
+    assert.ok(!callees.some((c) => c === ''), 'Fragment は対象外');
+  });
+
+  test('呼び出し行は要素名の行を指す', async () => {
+    const content = (await fetchFixture('page.tsx')).content;
+    const a = analyzer.analyzeFile('page.tsx', content);
+    const panel = a.functions
+      .find((f) => f.name === 'Page')
+      .calls.find((c) => c.callee === 'UI.Panel');
+    assert.equal(content.split('\n')[panel.line - 1].includes('<UI.Panel'), true);
+  });
+
+  test('JSX 呼び出しがグラフのエッジになる（default / named / namespace import）', async () => {
+    const graph = await buildFixtureGraph(['page.tsx']);
+
+    assert.deepEqual(
+      [...graph.analyzedFiles].sort(),
+      ['card.tsx', 'layout.tsx', 'page.tsx', 'ui.tsx', 'util.ts']
+    );
+    assert.ok(hasEdge(graph, 'Page', 'Layout'), 'default import の <Layout>');
+    assert.ok(hasEdge(graph, 'Page', 'Card'), 'named import の <Card>');
+    assert.ok(hasEdge(graph, 'Page', 'CardTitle'), 'named import の <CardTitle />');
+    assert.ok(hasEdge(graph, 'Page', 'Panel'), 'namespace import の <UI.Panel />');
+    assert.ok(hasEdge(graph, 'Page', 'toUpper'), '通常の関数呼び出し');
+  });
+
+  test('.jsx ファイルでも JSX 呼び出しがエッジになる', async () => {
+    const graph = await buildFixtureGraph(['legacy.jsx']);
+    assert.ok(hasEdge(graph, 'Legacy', 'Card'));
+  });
+
+  test('JSX を含まない TS ファイルの解析結果は変わらない', async () => {
+    const content = (await fetchFixture('util.ts')).content;
+    const a = analyzer.analyzeFile('util.ts', content);
+    assert.deepEqual(
+      a.functions.find((f) => f.name === 'helper').calls.map((c) => c.callee),
+      ['trim']
+    );
+  });
+});
+
 describe('isAnalyzablePath', () => {
   test('対象拡張子の判定', () => {
     for (const p of ['a.ts', 'a.tsx', 'a.js', 'a.jsx', 'a.mjs', 'a.cjs']) {

@@ -5,6 +5,7 @@ import type { Node } from 'web-tree-sitter';
 import { languageMetadata } from '../../shared/languages';
 import type { HighlightConfig } from '../highlight';
 import type {
+  CallNodePattern,
   DependencyTarget,
   FileAnalysis,
   ImportBinding,
@@ -65,6 +66,28 @@ const HIGHLIGHT: HighlightConfig = {
   ],
   member: { type: 'member_expression', field: 'property' },
 };
+
+/**
+ * JSX の要素名が「関数コンポーネントへの参照」か（issue #12）。
+ * JSX の規約どおり、小文字始まりの単純名は組み込み要素（`<div>` → 文字列タグ）、
+ * それ以外（`<Card>` / `<UI.Panel>`）はスコープ内の値の参照として扱う。
+ * `<svg:path>` のような XML 名前空間タグも組み込み扱いで対象外。
+ */
+function isComponentReference(name: string): boolean {
+  if (name.includes(':')) return false;
+  if (name.includes('.')) return true;
+  return !/^[a-z]/.test(name);
+}
+
+/**
+ * 呼び出しとして拾うノード。JSX 要素も関数コンポーネントの呼び出しなので依存に含める。
+ * jsx_closing_element は開始タグと同じ名前を持つため、二重計上しないよう対象にしない。
+ */
+const CALL_NODES: readonly CallNodePattern[] = [
+  'call_expression',
+  { type: 'jsx_opening_element', field: 'name', accepts: isComponentReference },
+  { type: 'jsx_self_closing_element', field: 'name', accepts: isComponentReference },
+];
 
 function isFunctionBoundary(node: Node): boolean {
   if (node.type === 'function_declaration' || node.type === 'method_definition') {
@@ -224,7 +247,7 @@ export const typescriptLanguage: LanguageDefinition = {
         endIndex: rangeNode.endIndex,
         exportName: directExportName(funcNode, name) ?? exportClauses.get(name),
         sourceText: rangeNode.text,
-        calls: collectCalls(bodyRoot, ['call_expression'], isFunctionBoundary),
+        calls: collectCalls(bodyRoot, CALL_NODES, isFunctionBoundary),
       };
     });
 
