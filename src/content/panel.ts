@@ -800,7 +800,7 @@ function findButtonAnchor(): HTMLElement | null {
 // GitHub の CSS 変数を参照して純正ボタンの見た目に寄せる（ダークテーマにも追従）
 const BUTTON_STYLE =
   'padding:0 12px;height:32px;font-size:14px;font-weight:500;cursor:pointer;' +
-  'font-family:inherit;border-radius:6px;' +
+  'font-family:inherit;border-radius:6px;white-space:nowrap;flex-shrink:0;' +
   'border:1px solid var(--button-default-borderColor-rest, #d1d9e0);' +
   'background:var(--button-default-bgColor-rest, #f6f8fa);' +
   'color:var(--button-default-fgColor-rest, #25292e);';
