@@ -19,6 +19,18 @@ export type HighlightKind =
  */
 export type HighlightToken = [start: number, end: number, kind: HighlightKind];
 
+/**
+ * PR で削除された行。head 側のソース（sourceText）には存在しないため、
+ * 「RIGHT サイドのどの行の直前に位置するか」で場所を表す。
+ * パネルは git diff と同じようにこの行を赤い `-` 行として挿入表示する。
+ */
+export interface DeletedDiffLine {
+  /** RIGHT サイド（head 側）でこの行番号の直前に位置する */
+  beforeLine: number;
+  /** 削除された行の内容（先頭の '-' を除く。改行は含まない） */
+  text: string;
+}
+
 /** グラフのノード = 関数 1 つ */
 export interface GraphNode {
   /** `${filePath}#${name}@${startLine}` 形式の一意 ID */
@@ -53,6 +65,16 @@ export interface GraphNode {
    * true: 変更ありでコメント可 / false かつ commentableLines が非空: 差分なしだがコメント可
    */
   hasChangedLine: boolean;
+  /**
+   * 関数の行範囲のうち、PR で追加・変更された行（patch の `+` 行）。昇順。
+   * commentableLines の部分集合で、パネルのソース表示を緑の `+` 行にするのに使う。
+   */
+  addedLines: number[];
+  /**
+   * 関数の行範囲内で削除された行（patch の `-` 行）。beforeLine の昇順。
+   * head 側に存在しない行なので、パネルは行番号なしの赤い `-` 行として挿入する。
+   */
+  deletedLines: DeletedDiffLine[];
   /** 関数定義のソーステキスト（Phase 4 のサイドパネル表示用） */
   sourceText: string;
   /** sourceText のシンタックスハイライト（tree-sitter の構文木から抽出） */

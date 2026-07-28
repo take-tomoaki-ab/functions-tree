@@ -312,6 +312,33 @@ describe('buildGraph: グラフ組み立て', () => {
     assert.equal(toUpper.hasChangedLine, false);
   });
 
+  test('パネルの diff ハイライト用に addedLines / deletedLines がノードに載る', async () => {
+    // main（9-17 行）で 11 行目を差し替えた hunk。RIGHT: 9-10 文脈 / 11 追加 / 12 文脈
+    const patch = [
+      '@@ -8,5 +8,5 @@',
+      ' ',
+      ' export function main(): void {',
+      "-  const message = toUpper('bye');",
+      "+  const message = toUpper('hello');",
+      '   logger.write(message);',
+    ].join('\n');
+    const graph = await buildFixtureGraph([{ path: 'app.ts', patch }], {
+      dependencyDepth: 0,
+    });
+
+    const main = findNode(graph, 'main');
+    assert.deepEqual(main.addedLines, [10], '追加行は commentableLines の部分集合');
+    assert.ok(main.commentableLines.includes(10));
+    assert.deepEqual(main.deletedLines, [
+      { beforeLine: 10, text: "  const message = toUpper('bye');" },
+    ]);
+
+    // 変更に掛からない関数（render: 19-24 行）は追加行も削除行も持たない
+    const render = findNode(graph, 'render');
+    assert.deepEqual(render.addedLines, []);
+    assert.deepEqual(render.deletedLines, []);
+  });
+
   test('範囲内に追加行がなければ推奨行は文脈行にフォールバックし、差分なしだがコメント可能になる（issue #10 回帰）', async () => {
     // render（19-24 行）に掛かる削除のみの hunk。RIGHT: 20-21 は文脈行
     const patch = [
@@ -339,6 +366,8 @@ describe('buildGraph: グラフ組み立て', () => {
       assert.deepEqual(node.commentableLines, []);
       assert.equal(node.commentLine, undefined);
       assert.equal(node.hasChangedLine, false);
+      assert.deepEqual(node.addedLines, []);
+      assert.deepEqual(node.deletedLines, []);
     }
   });
 
