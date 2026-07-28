@@ -14,6 +14,7 @@ import type {
   UpdatePendingCommentRequest,
 } from '../shared/messages';
 import { sendToBackground } from '../shared/messages';
+import { getSourcePaneHeight, setSourcePaneHeight } from '../shared/panel-prefs';
 import { draftNodeIds, findCommentForNode } from '../shared/review-drafts';
 import { getPat, PAT_KEY } from '../shared/settings';
 import type { GraphFilter } from './mermaid-source';
@@ -323,8 +324,12 @@ const PANEL_CSS = `
 .source {
   margin: 0 0 12px;
   padding: 8px;
-  max-height: 45%;
+  box-sizing: border-box;
+  height: 45%;
+  min-height: 80px;
+  max-height: 70vh;
   overflow: auto;
+  resize: vertical;
   background: rgba(140, 149, 159, 0.1);
   border: 1px solid rgba(140, 149, 159, 0.3);
   border-radius: 6px;
@@ -694,6 +699,12 @@ let currentGraph: FunctionGraph | null = null;
 let currentHeadSha: string | null = null;
 let selectedNode: GraphNode | null = null;
 let renderHandle: RenderHandle | null = null;
+// コード表示エリアの高さ（ユーザーがドラッグでリサイズした値、px）。
+// パネルを開いたときに storage から読み、ノード選択のたびに再生成される
+// .source 要素へ適用する。ユーザーがリサイズしたら debounce して保存する
+let sourcePaneHeightPx: number | null = null;
+let sourceResizeObserver: ResizeObserver | null = null;
+let sourceResizeSaveTimer: number | null = null;
 // グラフの表示倍率（1 = 実寸）。フィルタ切り替えの再描画でも維持し、
 // パネルを開き直したら 1 に戻す
 let zoomLevel = 1;
@@ -1421,6 +1432,32 @@ function renderHighlightedSource(
   if (pos < text.length) code.append(text.slice(pos));
 }
 
+/**
+ * コード表示エリア（.source）の高さをユーザーがドラッグでリサイズしたら記憶する。
+ * observe 開始直後に飛んでくる初回のコールバックは初期レイアウトの通知であり
+ * ユーザー操作ではないため無視する（そうしないとノード選択のたびに初期値で上書きされる）。
+ */
+function observeSourceResize(source: HTMLElement): void {
+  sourceResizeObserver?.disconnect();
+  let firstCallback = true;
+  sourceResizeObserver = new ResizeObserver(() => {
+    if (firstCallback) {
+      firstCallback = false;
+      return;
+    }
+    // border-box（box-sizing: border-box）で読む。ResizeObserver の contentRect は
+    // content-box のため、そのまま style.height（border-box）に書き戻すとズレる
+    const height = Math.round(source.getBoundingClientRect().height);
+    if (height <= 0) return;
+    sourcePaneHeightPx = height;
+    if (sourceResizeSaveTimer !== null) window.clearTimeout(sourceResizeSaveTimer);
+    sourceResizeSaveTimer = window.setTimeout(() => {
+      void setSourcePaneHeight(height);
+    }, 300);
+  });
+  sourceResizeObserver.observe(source);
+}
+
 /** サイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）を描画する */
 function renderNodeDetail(node: GraphNode): void {
   if (!sidePaneEl) return;
@@ -1448,9 +1485,13 @@ function renderNodeDetail(node: GraphNode): void {
 
   const source = document.createElement('pre');
   source.className = 'source';
+  if (sourcePaneHeightPx !== null) {
+    source.style.height = `${sourcePaneHeightPx}px`;
+  }
   const code = document.createElement('code');
   renderHighlightedSource(code, node.sourceText, node.highlightTokens ?? []);
   source.appendChild(code);
+  observeSourceResize(source);
 
   const commentArea = document.createElement('div');
   commentArea.className = 'comment-area';
@@ -1754,6 +1795,11 @@ function openPanel(): void {
     // （PR 画面で作った下書きも拾える。PAT 未設定なら「なし」が返るだけ）
     if (panelHost && currentPr === pr) void loadPendingReview(pr);
   });
+  // 前回リサイズしたコード表示エリアの高さを復元する
+  // （storage 読み込みが .source 生成より遅れても、以後のノード選択から反映される）
+  void getSourcePaneHeight().then((height) => {
+    sourcePaneHeightPx = height;
+  });
   panelHost = buildPanel();
   // トグルボタンを覆ってしまわないよう、パネルはボタンの下端から開く
   const button = document.getElementById(BUTTON_ID);
@@ -1789,6 +1835,12 @@ function closePanel(): void {
   zoomLevel = 1;
   zoomUiUpdater = null;
   commentUiUpdater = null;
+  sourceResizeObserver?.disconnect();
+  sourceResizeObserver = null;
+  if (sourceResizeSaveTimer !== null) {
+    window.clearTimeout(sourceResizeSaveTimer);
+    sourceResizeSaveTimer = null;
+  }
   // 下書きは GitHub の pending review に保存済み。次に開いたとき取得し直す
   pendingReviewId = null;
   drafts = [];

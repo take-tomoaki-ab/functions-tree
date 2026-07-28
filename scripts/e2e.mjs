@@ -43,6 +43,12 @@
 // - Ctrl/Cmd + ホイールでもズームできる（カーソル位置基準）
 // - リセットで 100%（基準サイズ）に戻る
 //
+// feat/issue-14-resizable-code-area で追加した確認項目:
+// - コード表示エリア（.source）が右下ハンドルのドラッグでリサイズできる
+//   （CSS resize: vertical）
+// - リサイズした高さが chrome.storage.local に保存され、パネルを閉じて
+//   開き直しても復元される
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -425,6 +431,36 @@ try {
   );
   await shot(page, '4-node-detail-source');
 
+  // 5a. コード表示エリア（.source）は右下ハンドルでリサイズできること（issue #14）。
+  //     ブラウザネイティブの CSS resize: vertical によるハンドルを実際にドラッグする
+  const readSourceRect = () =>
+    page.evaluate(() => {
+      const el = document
+        .querySelector('#functions-tree-panel-host')
+        ?.shadowRoot?.querySelector('.source');
+      const r = el?.getBoundingClientRect();
+      return r ? { width: r.width, height: r.height, right: r.right, bottom: r.bottom } : null;
+    });
+  const sourceRectBefore = await readSourceRect();
+  let sourceRectAfter = null;
+  if (sourceRectBefore) {
+    const handleX = sourceRectBefore.right - 6;
+    const handleY = sourceRectBefore.bottom - 6;
+    await page.mouse.move(handleX, handleY);
+    await page.mouse.down();
+    await page.mouse.move(handleX, handleY + 100, { steps: 10 });
+    await page.mouse.up();
+    sourceRectAfter = await readSourceRect();
+    record(
+      'source pane: drag handle resizes code area height',
+      !!sourceRectAfter && sourceRectAfter.height > sourceRectBefore.height + 30,
+      `before=${sourceRectBefore.height} after=${sourceRectAfter?.height}`
+    );
+    await shot(page, '4b-source-resized');
+  } else {
+    record('source pane: drag handle resizes code area height', false, '.source not found');
+  }
+
   // 6. フィルタトグル OFF（エッジのあるノードのみ → 全ノード）で表示が増えること
   await page.locator('#functions-tree-panel-host .filter-connected').click();
   await page.waitForFunction(
@@ -530,6 +566,18 @@ try {
     `status="${panel2.status}" nodes=${panel2.nodeCount}`
   );
   await shot(page, '6-panel-graph-cached');
+
+  // 7b. リサイズしたコード表示エリアの高さが記憶され、パネルを閉じて開き直しても
+  //     （chrome.storage.local への保存を経由して）復元されること（issue #14）
+  await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
+  const sourceRectRestored = await readSourceRect();
+  record(
+    'source pane: resized height is remembered across panel reopen',
+    !!sourceRectAfter && !!sourceRectRestored &&
+      Math.abs(sourceRectRestored.height - sourceRectAfter.height) <= 2,
+    `resized=${sourceRectAfter?.height} restored=${sourceRectRestored?.height}`
+  );
+  await shot(page, '6b-source-height-restored');
 
   // 8. 再度押下でパネルが閉じること
   await page.locator(BUTTON).click();
