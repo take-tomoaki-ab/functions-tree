@@ -84,6 +84,11 @@ export interface RangeCommentability {
    * 追加行がなければ最初のコメント可能行（文脈行）。lines が空なら undefined
    */
   commentLine?: number;
+  /**
+   * 範囲内に実際の追加行（diff）が含まれるか。
+   * false でも lines が非空なら、文脈行のみでコメント可能（差分なしノード）
+   */
+  hasChange: boolean;
 }
 
 /**
@@ -98,8 +103,13 @@ export function commentableLinesForRange(
   const inRange = (n: number): boolean => n >= startLine && n <= endLine;
   const lines = info.commentable.filter(inRange);
   const added = info.added.filter(inRange);
-  if (lines.length === 0) return { lines, added };
-  return { lines, added, commentLine: added[0] ?? lines[0] };
+  if (lines.length === 0) return { lines, added, hasChange: false };
+  return {
+    lines,
+    added,
+    commentLine: added[0] ?? lines[0],
+    hasChange: added.length > 0,
+  };
 }
 
 /**

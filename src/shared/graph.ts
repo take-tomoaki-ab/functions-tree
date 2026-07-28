@@ -53,12 +53,18 @@ export interface GraphNode {
   inDiff: boolean;
   /**
    * 関数の行範囲のうち、レビューコメントを付けられる行（patch の RIGHT サイドに
-   * 含まれる行）。昇順。空 = この関数にはコメントできない
-   * （diff 外、または変更ファイル内だが関数自体は無変更）。
+   * 含まれる行 = 追加行 + 文脈行）。昇順。空 = この関数にはコメントできない
+   * （diff 外、または変更ファイル内でも hunk の文脈行にすら掛からない）。
+   * 非空だが hasChangedLine が false の場合は「差分はないがコメント可能」。
    */
   commentableLines: number[];
   /** 推奨コメント行（範囲内の最初の追加行、なければ最初のコメント可能行） */
   commentLine?: number;
+  /**
+   * 関数の行範囲内に実際の追加行（diff）が含まれるか。
+   * true: 変更ありでコメント可 / false かつ commentableLines が非空: 差分なしだがコメント可
+   */
+  hasChangedLine: boolean;
   /**
    * 関数の行範囲のうち、PR で追加・変更された行（patch の `+` 行）。昇順。
    * commentableLines の部分集合で、パネルのソース表示を緑の `+` 行にするのに使う。

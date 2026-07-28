@@ -1089,9 +1089,9 @@ function buildPanel(): HTMLElement {
   const legend = document.createElement('span');
   legend.className = 'legend';
   legend.append(
-    createLegendItem('chip-commentable', 'コメント可（diff の行）'),
-    createLegendItem('chip-in-diff', '変更ファイル内（関数は無変更）'),
-    createLegendItem('chip-dep', '依存先（diff 外）'),
+    createLegendItem('chip-commentable', 'コメント可（変更あり）'),
+    createLegendItem('chip-in-diff', 'コメント可（差分なし）'),
+    createLegendItem('chip-dep', 'コメント不可（diff 外）'),
     createLegendItem('chip-draft', '下書きあり')
   );
   toolbar.append(legend);
