@@ -1,5 +1,6 @@
 // SW 内でのコールグラフ構築。analyzer-core に GitHub API と拡張内 wasm を配線し、
-// 解析結果を SW のメモリにキャッシュする（未認証レート制限 60 req/h の保護が主目的）。
+// 解析結果を chrome.storage.session にキャッシュする（未認証レート制限 60 req/h の保護、
+// および issue #13: パネルの開閉・SW のサスペンド/再起動をまたいだ再計算回避が目的）。
 
 import type { GithubResult } from '../shared/github';
 import type { GraphPayload } from '../shared/graph';
@@ -7,6 +8,8 @@ import type { PrRef } from '../shared/messages';
 import type { Analyzer, FetchFileResult, ListDirResult } from './analyzer-core';
 import { buildGraph, createAnalyzer, isAnalyzablePath } from './analyzer-core';
 import { getFileContent, getPrFiles, getPrInfo, listDirectory } from './github-api';
+import type { CacheEntry } from './graph-cache';
+import { cacheKey, resolveCacheHit } from './graph-cache';
 
 // Parser / Language の初期化は 10ms 程度だが、SW の生存中は使い回す。
 // SW が休止 → 再起動するとモジュールスコープごと消えるので、遅延初期化で包む。
@@ -28,24 +31,57 @@ function getAnalyzer(): Promise<Analyzer> {
   return analyzerPromise;
 }
 
-// 解析結果のメモリキャッシュ。SW が生きている間だけ有効で、head が進むとキーが変わる。
-const graphCache = new Map<string, GraphPayload>();
-
-function cacheKey(pr: PrRef, headSha: string): string {
-  return `${pr.owner}/${pr.repo}#${pr.pr}@${headSha}`;
+/**
+ * chrome.storage.session からキャッシュエントリを読む。MV3 の SW はモジュールスコープの
+ * 変数を保持できない（休止 → 再起動で消える）ため、storage.session に永続化することで
+ * パネルの開閉や SW 再起動をまたいだキャッシュヒットを実現する。読み取り失敗時は
+ * キャッシュなし扱いにして通常の解析にフォールバックする。
+ */
+async function readCache(key: string): Promise<CacheEntry | null> {
+  try {
+    const stored = await chrome.storage.session.get(key);
+    const entry = stored[key] as CacheEntry | undefined;
+    return entry ?? null;
+  } catch (e) {
+    console.warn(`[functions-tree] graph cache read failed: ${key}`, e);
+    return null;
+  }
 }
 
-/** BUILD_GRAPH の実体。GitHub API のエラーは GithubResult として呼び出し元に返す */
-export async function buildGraphForPr(pr: PrRef): Promise<GithubResult<GraphPayload>> {
+/**
+ * 容量制限（storage.session は約 10MB）超過等で書き込みに失敗しても、解析結果自体は
+ * 呼び出し元に返せているので、ここでは警告ログのみに留めてエラーにしない。
+ */
+async function writeCache(key: string, entry: CacheEntry): Promise<void> {
+  try {
+    await chrome.storage.session.set({ [key]: entry });
+  } catch (e) {
+    console.warn(`[functions-tree] graph cache write failed: ${key}`, e);
+  }
+}
+
+/**
+ * BUILD_GRAPH の実体。GitHub API のエラーは GithubResult として呼び出し元に返す。
+ * forceRefresh: true の場合はキャッシュを読まず必ず再解析する（明示的な再解析ボタン用）。
+ */
+export async function buildGraphForPr(
+  pr: PrRef,
+  opts: { forceRefresh?: boolean } = {}
+): Promise<GithubResult<GraphPayload>> {
   const infoRes = await getPrInfo(pr);
   if (!infoRes.ok) return infoRes;
   const { headSha, headRepo } = infoRes.value;
 
-  const key = cacheKey(pr, headSha);
-  const cached = graphCache.get(key);
-  if (cached) {
-    console.info(`[functions-tree] graph cache hit: ${key}`);
-    return { ok: true, authMode: infoRes.authMode, value: { ...cached, fromCache: true } };
+  const key = cacheKey(pr);
+  const cachedEntry = await readCache(key);
+  const cachedGraph = resolveCacheHit(cachedEntry, headSha, opts.forceRefresh ?? false);
+  if (cachedGraph) {
+    console.info(`[functions-tree] graph cache hit: ${key}@${headSha}`);
+    return {
+      ok: true,
+      authMode: infoRes.authMode,
+      value: { graph: cachedGraph, headSha, fromCache: true },
+    };
   }
 
   const filesRes = await getPrFiles(pr);
@@ -93,9 +129,9 @@ export async function buildGraphForPr(pr: PrRef): Promise<GithubResult<GraphPayl
   }
 
   const payload: GraphPayload = { graph, headSha, fromCache: false };
-  graphCache.set(key, payload);
+  await writeCache(key, { headSha, graph });
   console.info(
-    `[functions-tree] graph built: ${key} nodes=${graph.nodes.length} edges=${graph.edges.length} files=${graph.analyzedFiles.length} skipped=${graph.skippedFiles.length}`
+    `[functions-tree] graph built: ${key}@${headSha} nodes=${graph.nodes.length} edges=${graph.edges.length} files=${graph.analyzedFiles.length} skipped=${graph.skippedFiles.length}`
   );
   return { ok: true, authMode: filesRes.authMode, value: payload };
 }

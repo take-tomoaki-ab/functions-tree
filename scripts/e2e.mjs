@@ -52,6 +52,14 @@
 // - 行番号ガターの両端が `path:start-end` の行範囲と一致する
 // - 追加行は緑背景 + `+`、削除行は行番号なし + `-` で赤背景、`+n -m` サマリが出る
 //
+// feat/issue-13-analysis-result-cache で追加した確認項目:
+// - 解析結果のキャッシュが chrome.storage.session に永続化される（issue #13: パネルの
+//   開閉のたびに再計算されるのを解消）
+// - パネルヘッダーの「再解析」ボタンでキャッシュを無視して強制再計算できる
+//   （キャッシュヒット中でも明示的な再計算の導線が失われていないこと）
+// - CDP で SW（service worker）を強制終了し、パネル再オープンでの再起動をまたいでも
+//   キャッシュがヒットすること（旧実装の SW メモリの Map は SW 再起動で必ず消えていた）
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -666,6 +674,49 @@ try {
     `status="${panel2.status}" nodes=${panel2.nodeCount}`
   );
   await shot(page, '6-panel-graph-cached');
+
+  // 7b. issue #13: 「再解析」ボタンでキャッシュを無視して強制的に再計算できること
+  //     （キャッシュヒット中でも明示的な再計算の導線が失われていないことの確認）
+  await page.locator('#functions-tree-panel-host .graph-refresh').click();
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  const panelForced = await readPanel();
+  record(
+    'panel: 再解析 button forces recompute (bypasses cache, same node count)',
+    !panelForced.status.includes('（キャッシュ）') && panelForced.nodeCount === panel1.nodeCount,
+    `status="${panelForced.status}"`
+  );
+  await shot(page, '6b-panel-graph-force-refresh');
+
+  // 7c. issue #13 の本丸: SW を強制終了（サスペンド相当）しても、パネルを再度開いた
+  //     ときにキャッシュヒットし、再計算されないこと。旧実装（SW メモリの Map）では
+  //     SW 再起動でキャッシュが必ず消えていたが、chrome.storage.session への永続化で
+  //     再起動をまたいでも復元されることを確認する。
+  const cdp = await context.newCDPSession(page);
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  const swTarget = targetInfos.find((t) => t.type === 'service_worker');
+  record(
+    'e2e setup: found service worker target to force-restart',
+    !!swTarget,
+    JSON.stringify(swTarget?.url ?? null)
+  );
+  if (swTarget) {
+    await cdp.send('Target.closeTarget', { targetId: swTarget.targetId });
+    // SW が完全に落ちてから、パネル開閉のメッセージ送信で再起動をトリガーする
+    await page.waitForTimeout(500);
+  }
+  await page.locator(BUTTON).click(); // close
+  await page.locator(BUTTON).click(); // reopen（SW 再起動をまたぐ）
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  const panelAfterSwRestart = await readPanel();
+  record(
+    'panel: cache survives SW restart (chrome.storage.session persists, not lost like an in-memory Map)',
+    panelAfterSwRestart.status.includes('（キャッシュ）') &&
+      panelAfterSwRestart.nodeCount === panel1.nodeCount,
+    `status="${panelAfterSwRestart.status}"`
+  );
+  await shot(page, '6c-panel-graph-cache-survives-sw-restart');
 
   // 8. 再度押下でパネルが閉じること
   await page.locator(BUTTON).click();

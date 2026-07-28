@@ -56,11 +56,16 @@ export interface GetFileContentRequest {
 
 /**
  * PR のコールグラフを構築する（Phase 3）。
- * 解析は SW 内の tree-sitter で行い、結果は headSha をキーに SW メモリにキャッシュされる。
+ * 解析は SW 内の tree-sitter で行い、結果は chrome.storage.session に PR 単位で
+ * キャッシュされる（head SHA が変わっていなければヒット、パネルの開閉や SW の
+ * サスペンド/再起動をまたいで有効）。forceRefresh: true でキャッシュを無視して再解析する
+ * （パネルの「再解析」ボタン用）。
  */
 export interface BuildGraphRequest {
   type: 'BUILD_GRAPH';
   pr: PrRef;
+  /** true ならキャッシュを読まず必ず再解析する */
+  forceRefresh?: boolean;
 }
 
 /**
