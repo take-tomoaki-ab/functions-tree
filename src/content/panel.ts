@@ -20,6 +20,8 @@ import { getPat, PAT_KEY } from '../shared/settings';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
 import type { GraphRenderer, RenderHandle } from './mermaid-view';
+import type { SourceRow } from './source-diff';
+import { buildSourceRows, diffStat } from './source-diff';
 import {
   anchoredScroll,
   clampZoom,
@@ -93,6 +95,24 @@ const PANEL_CSS = `
 }
 .close-button:hover {
   background: rgba(140, 149, 159, 0.2);
+}
+.graph-refresh {
+  margin-left: 12px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 400;
+  border: 1px solid rgba(140, 149, 159, 0.5);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.graph-refresh:hover:enabled {
+  background: rgba(140, 149, 159, 0.2);
+}
+.graph-refresh:disabled {
+  color: #59636e;
+  cursor: not-allowed;
 }
 .toolbar {
   display: flex;
@@ -335,10 +355,59 @@ const PANEL_CSS = `
   border-radius: 6px;
 }
 .source code {
+  display: block;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   line-height: 1.45;
   white-space: pre;
+}
+/* git diff 風の行表示: 行番号 + マーカー（+/-）+ 本文。
+   横スクロール時も行背景が途切れないよう、行幅は内容に合わせて 100% 以上にする */
+.src-line {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+}
+.src-lineno,
+.src-marker {
+  display: inline-block;
+  /* 行番号とマーカーはコードの一部ではないのでコピー対象から外す */
+  user-select: none;
+  -webkit-user-select: none;
+  color: #59636e;
+}
+.src-lineno {
+  width: 3.5em;
+  padding-right: 6px;
+  text-align: right;
+}
+.src-marker { width: 1.2ch; }
+.src-line.src-add { background: rgba(31, 136, 61, 0.16); }
+.src-line.src-add .src-marker { color: #1a7f37; font-weight: 600; }
+.src-line.src-del { background: rgba(207, 34, 46, 0.16); }
+.src-line.src-del .src-marker { color: #cf222e; font-weight: 600; }
+/* 削除行は旧内容なのでハイライトせず、変更後のコードと区別できる色で出す */
+.src-line.src-del .src-content { color: #82071e; }
+@media (prefers-color-scheme: dark) {
+  .src-lineno,
+  .src-marker { color: #9198a1; }
+  .src-line.src-add { background: rgba(63, 185, 80, 0.15); }
+  .src-line.src-add .src-marker { color: #3fb950; }
+  .src-line.src-del { background: rgba(248, 81, 73, 0.15); }
+  .src-line.src-del .src-marker { color: #f85149; }
+  .src-line.src-del .src-content { color: #ffa198; }
+}
+/* 追加 / 削除の行数サマリ（詳細タイトル横） */
+.diff-stat {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.diff-stat .diff-stat-add { color: #1a7f37; font-weight: 600; }
+.diff-stat .diff-stat-del { color: #cf222e; font-weight: 600; }
+@media (prefers-color-scheme: dark) {
+  .diff-stat .diff-stat-add { color: #3fb950; }
+  .diff-stat .diff-stat-del { color: #f85149; }
 }
 /* シンタックスハイライト（GitHub のライト / ダーク配色に合わせる） */
 .source .tok-keyword { color: #cf222e; }
@@ -668,6 +737,8 @@ const PANEL_CSS = `
 `;
 
 let panelHost: HTMLElement | null = null;
+let graphRefreshEl: HTMLButtonElement | null = null;
+let graphBusy = false;
 let statusEl: HTMLElement | null = null;
 let authNoticeEl: HTMLElement | null = null;
 let graphAreaEl: HTMLElement | null = null;
@@ -1022,6 +1093,16 @@ function buildPanel(): HTMLElement {
   header.className = 'panel-header';
   const title = document.createElement('span');
   title.textContent = '関数依存グラフ';
+  // キャッシュヒット時も明示的に再解析できる導線（issue #13: 更新ボタンに相当）
+  graphRefreshEl = document.createElement('button');
+  graphRefreshEl.className = 'graph-refresh';
+  graphRefreshEl.type = 'button';
+  graphRefreshEl.textContent = '再解析';
+  graphRefreshEl.title = 'キャッシュを使わずに解析し直す';
+  graphRefreshEl.addEventListener('click', () => {
+    if (graphBusy || !currentPr) return;
+    void loadGraph(currentPr, { forceRefresh: true });
+  });
   const close = document.createElement('button');
   close.className = 'close-button';
   close.type = 'button';
@@ -1029,7 +1110,7 @@ function buildPanel(): HTMLElement {
   close.title = '閉じる（Esc）';
   close.textContent = '✕';
   close.addEventListener('click', closePanel);
-  header.append(title, close);
+  header.append(title, graphRefreshEl, close);
 
   const toolbar = document.createElement('div');
   toolbar.className = 'toolbar';
@@ -1049,9 +1130,9 @@ function buildPanel(): HTMLElement {
   const legend = document.createElement('span');
   legend.className = 'legend';
   legend.append(
-    createLegendItem('chip-commentable', 'コメント可（diff の行）'),
-    createLegendItem('chip-in-diff', '変更ファイル内（関数は無変更）'),
-    createLegendItem('chip-dep', '依存先（diff 外）'),
+    createLegendItem('chip-commentable', 'コメント可（変更あり）'),
+    createLegendItem('chip-in-diff', 'コメント可（差分なし）'),
+    createLegendItem('chip-dep', 'コメント不可（diff 外）'),
     createLegendItem('chip-draft', '下書きあり')
   );
   toolbar.append(legend);
@@ -1409,7 +1490,56 @@ function renderSidePlaceholder(): void {
 }
 
 /**
- * sourceText をハイライトトークンに沿って span に分割し code 要素へ流し込む。
+ * ソースを git diff 風の行単位ビューとして code 要素へ流し込む。
+ * 1 行 = `<span class="src-line src-{add,del,context}">` に行番号 + マーカー + 本文。
+ * 追加行は緑・削除行は赤で塗るので、パネル内でどこが差分か一目で分かる。
+ */
+function renderSourceRows(code: HTMLElement, rows: SourceRow[]): void {
+  for (const row of rows) {
+    const line = document.createElement('span');
+    line.className = `src-line src-${row.kind}`;
+
+    const lineNo = document.createElement('span');
+    lineNo.className = 'src-lineno';
+    lineNo.textContent = row.lineNo !== undefined ? String(row.lineNo) : '';
+
+    const marker = document.createElement('span');
+    marker.className = 'src-marker';
+    marker.textContent = row.kind === 'add' ? '+' : row.kind === 'del' ? '-' : ' ';
+
+    const content = document.createElement('span');
+    content.className = 'src-content';
+    renderHighlightedSource(content, row.text, row.tokens);
+
+    line.append(lineNo, marker, content);
+    code.appendChild(line);
+  }
+}
+
+/** `+3 -1` の差分サマリ。追加も削除もなければ null（無変更の関数） */
+function buildDiffStat(rows: SourceRow[]): HTMLElement | null {
+  const { added, deleted } = diffStat(rows);
+  if (added === 0 && deleted === 0) return null;
+  const el = document.createElement('span');
+  el.className = 'diff-stat';
+  if (added > 0) {
+    const a = document.createElement('span');
+    a.className = 'diff-stat-add';
+    a.textContent = `+${added}`;
+    el.appendChild(a);
+  }
+  if (deleted > 0) {
+    if (added > 0) el.append(' ');
+    const d = document.createElement('span');
+    d.className = 'diff-stat-del';
+    d.textContent = `-${deleted}`;
+    el.appendChild(d);
+  }
+  return el;
+}
+
+/**
+ * 1 行分のテキストをハイライトトークンに沿って span に分割し親要素へ流し込む。
  * トークン間の隙間（識別子・記号・空白）は無装飾のテキストノードで出す。
  * innerHTML は使わない（sourceText はリポジトリ由来の任意文字列）。
  */
@@ -1472,6 +1602,10 @@ function renderNodeDetail(node: GraphNode): void {
   badge.textContent = node.inDiff ? 'diff 内' : 'diff 外';
   titleRow.append(name, badge);
 
+  const rows = buildSourceRows(node);
+  const stat = buildDiffStat(rows);
+  if (stat) titleRow.appendChild(stat);
+
   const location = document.createElement('p');
   location.className = 'detail-meta';
   location.textContent = `${node.filePath}:${node.startLine}-${node.endLine}`;
@@ -1489,7 +1623,7 @@ function renderNodeDetail(node: GraphNode): void {
     source.style.height = `${sourcePaneHeightPx}px`;
   }
   const code = document.createElement('code');
-  renderHighlightedSource(code, node.sourceText, node.highlightTokens ?? []);
+  renderSourceRows(code, rows);
   source.appendChild(code);
   observeSourceResize(source);
 
@@ -1741,12 +1875,18 @@ async function renderGraph(): Promise<void> {
   }
 }
 
-async function loadGraph(pr: PrRef): Promise<void> {
+async function loadGraph(pr: PrRef, opts: { forceRefresh?: boolean } = {}): Promise<void> {
   if (!statusEl) return;
+  graphBusy = true;
+  if (graphRefreshEl) graphRefreshEl.disabled = true;
   delete statusEl.dataset.state;
-  statusEl.textContent = 'コールグラフを解析中…';
+  statusEl.textContent = opts.forceRefresh ? 'コールグラフを再解析中…' : 'コールグラフを解析中…';
   try {
-    const res = await sendToBackground({ type: 'BUILD_GRAPH', pr });
+    const res = await sendToBackground({
+      type: 'BUILD_GRAPH',
+      pr,
+      forceRefresh: opts.forceRefresh,
+    });
     // パネルが閉じられていたら描画しない
     if (!statusEl || !authNoticeEl || !panelHost) return;
     authNoticeEl.dataset.visible = res.authMode === 'anonymous' ? 'true' : 'false';
@@ -1769,6 +1909,9 @@ async function loadGraph(pr: PrRef): Promise<void> {
     if (!statusEl) return;
     statusEl.dataset.state = 'error';
     statusEl.textContent = `background との通信に失敗: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    graphBusy = false;
+    if (graphRefreshEl) graphRefreshEl.disabled = false;
   }
 }
 
@@ -1780,6 +1923,7 @@ function openPanel(): void {
   currentGraph = null;
   currentHeadSha = null;
   renderHandle = null;
+  graphBusy = false;
   zoomLevel = 1;
   pendingReviewId = null;
   drafts = [];
@@ -1816,6 +1960,7 @@ function closePanel(): void {
   document.removeEventListener('keydown', handleEscapeKeydown, true);
   panelHost?.remove();
   panelHost = null;
+  graphRefreshEl = null;
   statusEl = null;
   authNoticeEl = null;
   graphAreaEl = null;

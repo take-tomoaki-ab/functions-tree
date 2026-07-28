@@ -43,6 +43,23 @@
 // - Ctrl/Cmd + ホイールでもズームできる（カーソル位置基準）
 // - リセットで 100%（基準サイズ）に戻る
 //
+// bugfix/issue-10-yellow-node-comment で追加した確認項目:
+// - 黄色ノード（差分はないが diff コンテキスト内でコメント可能）に実際にコメント
+//   フォームが出ること（本当にコメント不可なのは .dep クラスのノードだけ）
+//
+// feat/issue-11-code-diff-highlight で追加した確認項目:
+// - ノード詳細のソースが git diff 風の行単位表示になる（行番号ガター + +/- マーカー）
+// - 行番号ガターの両端が `path:start-end` の行範囲と一致する
+// - 追加行は緑背景 + `+`、削除行は行番号なし + `-` で赤背景、`+n -m` サマリが出る
+//
+// feat/issue-13-analysis-result-cache で追加した確認項目:
+// - 解析結果のキャッシュが chrome.storage.session に永続化される（issue #13: パネルの
+//   開閉のたびに再計算されるのを解消）
+// - パネルヘッダーの「再解析」ボタンでキャッシュを無視して強制再計算できる
+//   （キャッシュヒット中でも明示的な再計算の導線が失われていないこと）
+// - CDP で SW（service worker）を強制終了し、パネル再オープンでの再起動をまたいでも
+//   キャッシュがヒットすること（旧実装の SW メモリの Map は SW 再起動で必ず消えていた）
+//
 // feat/issue-14-resizable-code-area で追加した確認項目:
 // - コード表示エリア（.source）が右下ハンドルのドラッグでリサイズできる
 //   （CSS resize: vertical）
@@ -380,6 +397,38 @@ try {
         commentStatusText:
           (shadow?.querySelector('.comment-status')?.textContent ?? '').trim(),
         disabledReason: (shadow?.querySelector('.comment-disabled')?.textContent ?? '').trim(),
+        // feat/issue-11-code-diff-highlight: git diff 風の行単位表示
+        diffRows: (() => {
+          const rows = [...(shadow?.querySelectorAll('.source code .src-line') ?? [])];
+          const has = (r, c) => r.classList.contains(c);
+          return {
+            total: rows.length,
+            add: rows.filter((r) => has(r, 'src-add')).length,
+            del: rows.filter((r) => has(r, 'src-del')).length,
+            context: rows.filter((r) => has(r, 'src-context')).length,
+          };
+        })(),
+        // 行番号ガター（削除行は行番号なしなので、番号のある最初/最後の行を見る）
+        numberedLines: (() => {
+          const nos = [...(shadow?.querySelectorAll('.source code .src-line') ?? [])]
+            .map((r) => (r.querySelector('.src-lineno')?.textContent ?? '').trim())
+            .filter((t) => t !== '');
+          return { first: nos[0] ?? '', last: nos[nos.length - 1] ?? '' };
+        })(),
+        // 追加行 / 削除行 / 文脈行の見た目（マーカー文字と実効背景色）
+        rowStyles: (() => {
+          const pick = (cls) => {
+            const r = shadow?.querySelector(`.source code .src-line.${cls}`);
+            if (!r) return null;
+            return {
+              marker: r.querySelector('.src-marker')?.textContent ?? '',
+              lineNo: (r.querySelector('.src-lineno')?.textContent ?? '').trim(),
+              bg: getComputedStyle(r).backgroundColor,
+            };
+          };
+          return { add: pick('src-add'), del: pick('src-del'), context: pick('src-context') };
+        })(),
+        diffStat: (shadow?.querySelector('.diff-stat')?.textContent ?? '').trim(),
       };
     });
 
@@ -507,6 +556,75 @@ try {
   );
   await shot(page, '5b-commentable-node-anonymous');
 
+  // === feat/issue-11-code-diff-highlight ===
+  // 6.3b. パネル内のソースが git diff 風に行単位でハイライトされること。
+  //       コメント可能ノードは「追加行あり」と「文脈行のみ」の両方があり得るので、
+  //       追加行を持つノードが見つかるまで順にクリックして探す。
+  const commentableNodes = page.locator(
+    '#functions-tree-panel-host .graph-area g.node.commentable'
+  );
+  const commentableTotal = await commentableNodes.count();
+  let anyRows = null; // 行表示が出た最初のノード
+  let withAdd = null; // 追加行を含むノード
+  for (let i = 0; i < Math.min(commentableTotal, 15); i++) {
+    await commentableNodes.nth(i).click();
+    const d = await readDetail();
+    if (!anyRows && d.diffRows.total > 0) anyRows = d;
+    if (d.diffRows.add > 0) {
+      withAdd = d;
+      break;
+    }
+  }
+  const rowsDetail = anyRows ?? (await readDetail());
+  // 行の内訳が総数と一致 = すべての行が add / del / context のどれかに分類されている。
+  // 行番号ガターの両端が `path:start-end` の範囲と一致 = ファイルの実行番号に対応している
+  const metaRange = /:(\d+)-(\d+)$/.exec(rowsDetail.meta);
+  record(
+    'node detail: source is rendered as diff rows (line-number gutter + markers)',
+    rowsDetail.diffRows.total > 0 &&
+      rowsDetail.diffRows.add + rowsDetail.diffRows.del + rowsDetail.diffRows.context ===
+        rowsDetail.diffRows.total &&
+      metaRange !== null &&
+      rowsDetail.numberedLines.first === metaRange[1] &&
+      rowsDetail.numberedLines.last === metaRange[2] &&
+      // 文脈行はマーカーなし（新規追加された関数は全行 add で文脈行が無いこともある）
+      (rowsDetail.rowStyles.context === null ||
+        rowsDetail.rowStyles.context.marker === ' '),
+    `rows=${JSON.stringify(rowsDetail.diffRows)} gutter=${rowsDetail.numberedLines.first}-` +
+      `${rowsDetail.numberedLines.last} meta=${rowsDetail.meta}`
+  );
+  if (withAdd) {
+    const add = withAdd.rowStyles.add;
+    const ctx = withAdd.rowStyles.context;
+    // 追加行は `+` マーカー + 行番号あり + 文脈行とは異なる（透明でない）背景色
+    record(
+      'node detail: added lines highlighted with + marker and green background',
+      add !== null && add.marker === '+' && /^\d+$/.test(add.lineNo) &&
+        add.bg !== 'rgba(0, 0, 0, 0)' && add.bg !== ctx?.bg &&
+        withAdd.diffStat.startsWith(`+${withAdd.diffRows.add}`),
+      `add=${JSON.stringify(add)} contextBg=${ctx?.bg} stat="${withAdd.diffStat}"`
+    );
+    // 削除行は同じノードにあるとは限らないので、あるときだけ検証する
+    const del = withAdd.rowStyles.del;
+    record(
+      'node detail: deleted lines shown as - rows without line numbers',
+      del === null || (del.marker === '-' && del.lineNo === '' &&
+        del.bg !== 'rgba(0, 0, 0, 0)' && del.bg !== add?.bg),
+      del === null
+        ? `このノードに削除行なし（del=${withAdd.diffRows.del}）`
+        : `del=${JSON.stringify(del)}`
+    );
+    await shot(page, '5b1-node-detail-diff-highlight');
+  } else {
+    record(
+      'node detail: added lines highlighted with + marker and green background',
+      false,
+      `追加行を持つコメント可能ノードが見つからない（commentable=${commentableTotal}）`
+    );
+  }
+  // 以降のコメント欄確認のためコメント可能ノードを選び直す
+  await commentableNodes.first().click();
+
   // === bugfix/keyboard-shortcut-leak ===
   // 6.4. パネル内のキー入力が shadow 境界を越えて document まで伝播しないこと。
   //      GitHub のショートカットハンドラは document で listen しているため、
@@ -534,15 +652,17 @@ try {
   // 後始末: 入力を空に戻す（以降のコメント欄確認に影響させない）
   await page.locator('#functions-tree-panel-host .comment-input').fill('');
 
-  // 6.5. コメント不可ノード（diff 外 / 関数無変更）で理由が表示されること
+  // 6.5. コメント不可ノード（diff 外 / hunk に一切掛からない）で理由が表示されること
+  //      .commentable と .inDiff（差分なしだがコメント可）はどちらも投稿可能なので、
+  //      「本当にコメント不可」なのは .dep クラスのノードだけ（issue #10 の修正後の分類）
   const nonCommentable = page.locator(
-    '#functions-tree-panel-host .graph-area g.node:not(.commentable)'
+    '#functions-tree-panel-host .graph-area g.node.dep'
   );
   if ((await nonCommentable.count()) > 0) {
     await nonCommentable.first().click();
     const ncDetail = await readDetail();
     record(
-      'non-commentable node: reason shown, no comment form',
+      'non-commentable node (gray): reason shown, no comment form',
       (ncDetail.disabledReason.includes('関数は変更されていません') ||
         ncDetail.disabledReason.includes('diff 外のためコメント不可')) &&
         !ncDetail.hasCommentInput,
@@ -550,8 +670,32 @@ try {
     );
     await shot(page, '5c-non-commentable-reason');
   } else {
-    record('non-commentable node: reason shown, no comment form', false,
+    record('non-commentable node (gray): reason shown, no comment form', false,
       'この PR には コメント不可ノードがない（別の PR で確認要）');
+  }
+
+  // 6.6. issue #10 回帰: 黄色ノード（差分なしだがコメント可能）は実際にコメントフォームが
+  //      出ること（disabled 理由ではなく対象行が表示される）
+  const inDiffOnly = page.locator(
+    '#functions-tree-panel-host .graph-area g.node.inDiff'
+  );
+  if ((await inDiffOnly.count()) > 0) {
+    await inDiffOnly.first().click();
+    const yDetail = await readDetail();
+    record(
+      'issue #10 regression: yellow node (no diff, in diff context) is commentable',
+      yDetail.hasCommentInput && yDetail.commentTarget.includes('にコメントされます') &&
+        yDetail.disabledReason === '',
+      `hasCommentInput=${yDetail.hasCommentInput} target="${yDetail.commentTarget}" ` +
+        `disabledReason="${yDetail.disabledReason}"`
+    );
+    await shot(page, '5d-indiff-node-commentable');
+  } else {
+    record(
+      'issue #10 regression: yellow node (no diff, in diff context) is commentable',
+      false,
+      'この PR には黄色（差分なしだがコメント可能）ノードがない（別の PR で確認要）'
+    );
   }
 
   // 7. 閉じて開き直すと SW メモリキャッシュから返ること（レート制限を消費しない）
@@ -567,7 +711,50 @@ try {
   );
   await shot(page, '6-panel-graph-cached');
 
-  // 7b. リサイズしたコード表示エリアの高さが記憶され、パネルを閉じて開き直しても
+  // 7b. issue #13: 「再解析」ボタンでキャッシュを無視して強制的に再計算できること
+  //     （キャッシュヒット中でも明示的な再計算の導線が失われていないことの確認）
+  await page.locator('#functions-tree-panel-host .graph-refresh').click();
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  const panelForced = await readPanel();
+  record(
+    'panel: 再解析 button forces recompute (bypasses cache, same node count)',
+    !panelForced.status.includes('（キャッシュ）') && panelForced.nodeCount === panel1.nodeCount,
+    `status="${panelForced.status}"`
+  );
+  await shot(page, '6b-panel-graph-force-refresh');
+
+  // 7c. issue #13 の本丸: SW を強制終了（サスペンド相当）しても、パネルを再度開いた
+  //     ときにキャッシュヒットし、再計算されないこと。旧実装（SW メモリの Map）では
+  //     SW 再起動でキャッシュが必ず消えていたが、chrome.storage.session への永続化で
+  //     再起動をまたいでも復元されることを確認する。
+  const cdp = await context.newCDPSession(page);
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  const swTarget = targetInfos.find((t) => t.type === 'service_worker');
+  record(
+    'e2e setup: found service worker target to force-restart',
+    !!swTarget,
+    JSON.stringify(swTarget?.url ?? null)
+  );
+  if (swTarget) {
+    await cdp.send('Target.closeTarget', { targetId: swTarget.targetId });
+    // SW が完全に落ちてから、パネル開閉のメッセージ送信で再起動をトリガーする
+    await page.waitForTimeout(500);
+  }
+  await page.locator(BUTTON).click(); // close
+  await page.locator(BUTTON).click(); // reopen（SW 再起動をまたぐ）
+  await waitForGraphStatus();
+  await waitForGraphRender();
+  const panelAfterSwRestart = await readPanel();
+  record(
+    'panel: cache survives SW restart (chrome.storage.session persists, not lost like an in-memory Map)',
+    panelAfterSwRestart.status.includes('（キャッシュ）') &&
+      panelAfterSwRestart.nodeCount === panel1.nodeCount,
+    `status="${panelAfterSwRestart.status}"`
+  );
+  await shot(page, '6c-panel-graph-cache-survives-sw-restart');
+
+  // 7d. リサイズしたコード表示エリアの高さが記憶され、パネルを閉じて開き直しても
   //     （chrome.storage.local への保存を経由して）復元されること（issue #14）
   await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
   const sourceRectRestored = await readSourceRect();
@@ -577,7 +764,7 @@ try {
       Math.abs(sourceRectRestored.height - sourceRectAfter.height) <= 2,
     `resized=${sourceRectAfter?.height} restored=${sourceRectRestored?.height}`
   );
-  await shot(page, '6b-source-height-restored');
+  await shot(page, '6d-source-height-restored');
 
   // 8. 再度押下でパネルが閉じること
   await page.locator(BUTTON).click();
