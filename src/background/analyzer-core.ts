@@ -14,7 +14,11 @@ import type {
   SkippedFile,
 } from '../shared/graph';
 import type { PatchCommentableLines } from './diff-lines';
-import { commentableLinesForRange, parsePatchCommentableLines } from './diff-lines';
+import {
+  commentableLinesForRange,
+  deletedLinesForRange,
+  parsePatchCommentableLines,
+} from './diff-lines';
 import { collectHighlightTokens, tokensForRange } from './highlight';
 import { LANGUAGE_DEFINITIONS, languageForPath } from './languages';
 import type {
@@ -379,9 +383,18 @@ function assembleGraph(
     for (const fn of analysis.functions) {
       // 行レベルのコメント可否: 関数の行範囲 ∩ patch のコメント可能行。
       // diff 外のファイル、変更ファイル内でも関数範囲に diff の行がなければ空になる
-      const { lines, commentLine } = patchLines
+      const { lines, added, commentLine, hasChange } = patchLines
         ? commentableLinesForRange(patchLines, fn.startLine, fn.endLine)
-        : { lines: [] as number[], commentLine: undefined };
+        : {
+            lines: [] as number[],
+            added: [] as number[],
+            commentLine: undefined,
+            hasChange: false,
+          };
+      // 削除行は head 側に行番号を持たないため別に集める（パネルの `-` 行表示用）
+      const deletedLines = patchLines
+        ? deletedLinesForRange(patchLines, fn.startLine, fn.endLine)
+        : [];
       nodes.push({
         id: nodeId(path, fn.name, fn.startLine),
         name: fn.name,
@@ -393,6 +406,9 @@ function assembleGraph(
         inDiff: changedSet.has(path),
         commentableLines: lines,
         commentLine,
+        hasChangedLine: hasChange,
+        addedLines: added,
+        deletedLines,
         sourceText: fn.sourceText,
         highlightTokens: fn.highlights ?? [],
       });
