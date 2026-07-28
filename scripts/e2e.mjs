@@ -60,6 +60,12 @@
 // - CDP で SW（service worker）を強制終了し、パネル再オープンでの再起動をまたいでも
 //   キャッシュがヒットすること（旧実装の SW メモリの Map は SW 再起動で必ず消えていた）
 //
+// feat/issue-14-resizable-code-area で追加した確認項目:
+// - パネル内のグラフ領域とサイドペインの間に区切りバー（.splitter）があり、
+//   ドラッグでサイドペインの幅を変えられる（pointerdown/move/up + pointer capture）
+// - リサイズした幅が chrome.storage.local に保存され、パネルを閉じて
+//   開き直しても復元される
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -474,6 +480,44 @@ try {
   );
   await shot(page, '4-node-detail-source');
 
+  // 5a. グラフ領域とサイドペインの間の区切りバー（.splitter）をドラッグすると
+  //     サイドペインの幅が変わること（issue #14 作り直し版）
+  const readSidePaneRect = () =>
+    page.evaluate(() => {
+      const el = document
+        .querySelector('#functions-tree-panel-host')
+        ?.shadowRoot?.querySelector('.side-pane');
+      const r = el?.getBoundingClientRect();
+      return r ? { width: r.width } : null;
+    });
+  const readSplitterCenter = () =>
+    page.evaluate(() => {
+      const el = document
+        .querySelector('#functions-tree-panel-host')
+        ?.shadowRoot?.querySelector('.splitter');
+      const r = el?.getBoundingClientRect();
+      return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+    });
+  const sidePaneRectBefore = await readSidePaneRect();
+  const splitterCenter = await readSplitterCenter();
+  let sidePaneRectAfter = null;
+  if (sidePaneRectBefore && splitterCenter) {
+    await page.mouse.move(splitterCenter.x, splitterCenter.y);
+    await page.mouse.down();
+    // サイドペインは右側固定なので、左へドラッグすると幅が増える
+    await page.mouse.move(splitterCenter.x - 80, splitterCenter.y, { steps: 10 });
+    await page.mouse.up();
+    sidePaneRectAfter = await readSidePaneRect();
+    record(
+      'splitter: dragging left increases side pane width',
+      !!sidePaneRectAfter && sidePaneRectAfter.width > sidePaneRectBefore.width + 30,
+      `before=${sidePaneRectBefore.width} after=${sidePaneRectAfter?.width}`
+    );
+    await shot(page, '4b-splitter-resized');
+  } else {
+    record('splitter: dragging left increases side pane width', false, '.splitter or .side-pane not found');
+  }
+
   // 6. フィルタトグル OFF（エッジのあるノードのみ → 全ノード）で表示が増えること
   await page.locator('#functions-tree-panel-host .filter-connected').click();
   await page.waitForFunction(
@@ -717,6 +761,18 @@ try {
     `status="${panelAfterSwRestart.status}"`
   );
   await shot(page, '6c-panel-graph-cache-survives-sw-restart');
+
+  // 7d. リサイズしたサイドペイン幅が記憶され、パネルを閉じて開き直しても
+  //     （chrome.storage.local への保存を経由して）復元されること（issue #14 作り直し版）
+  await page.locator('#functions-tree-panel-host .graph-area g.node').first().click();
+  const sidePaneRectRestored = await readSidePaneRect();
+  record(
+    'splitter: resized side pane width is remembered across panel reopen',
+    !!sidePaneRectAfter && !!sidePaneRectRestored &&
+      Math.abs(sidePaneRectRestored.width - sidePaneRectAfter.width) <= 2,
+    `resized=${sidePaneRectAfter?.width} restored=${sidePaneRectRestored?.width}`
+  );
+  await shot(page, '6d-side-pane-width-restored');
 
   // 8. 再度押下でパネルが閉じること
   await page.locator(BUTTON).click();
