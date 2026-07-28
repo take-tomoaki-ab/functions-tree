@@ -379,9 +379,9 @@ function assembleGraph(
     for (const fn of analysis.functions) {
       // 行レベルのコメント可否: 関数の行範囲 ∩ patch のコメント可能行。
       // diff 外のファイル、変更ファイル内でも関数範囲に diff の行がなければ空になる
-      const { lines, commentLine } = patchLines
+      const { lines, commentLine, hasChange } = patchLines
         ? commentableLinesForRange(patchLines, fn.startLine, fn.endLine)
-        : { lines: [] as number[], commentLine: undefined };
+        : { lines: [] as number[], commentLine: undefined, hasChange: false };
       nodes.push({
         id: nodeId(path, fn.name, fn.startLine),
         name: fn.name,
@@ -393,6 +393,7 @@ function assembleGraph(
         inDiff: changedSet.has(path),
         commentableLines: lines,
         commentLine,
+        hasChangedLine: hasChange,
         sourceText: fn.sourceText,
         highlightTokens: fn.highlights ?? [],
       });

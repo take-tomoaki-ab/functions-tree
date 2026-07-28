@@ -44,17 +44,21 @@ export interface MermaidGraphSource {
   nodeByMermaidId: Map<string, GraphNode>;
 }
 
-/** コメント可能ノード（diff の行を含む関数）の mermaid クラス名（SVG の g.node にも付く） */
+/** 実際に変更された行を含む関数（コメント可）の mermaid クラス名（SVG の g.node にも付く） */
 export const NODE_CLASS_COMMENTABLE = 'commentable';
-/** 変更ファイル内だが関数自体は無変更（コメント不可）のクラス名 */
+/**
+ * 差分はないが diff コンテキスト内（hunk の文脈行）にありコメント可能な関数のクラス名。
+ * GitHub の PR コメント API は文脈行にもコメントできるため、この区分もコメント可能
+ */
 export const NODE_CLASS_IN_DIFF = 'inDiff';
-/** diff 外の依存先ノードに付ける mermaid クラス名 */
+/** diff 外、または変更ファイル内でも hunk に掛からずコメント不可なノードのクラス名 */
 export const NODE_CLASS_DEPENDENCY = 'dep';
 
-/** ノードの表示クラス分け: コメント可（行レベル）> 変更ファイル内 > 依存先 */
+/** ノードの表示クラス分け: 変更あり(緑) > 差分なしだがコメント可(黄) > コメント不可(グレー) */
 export function nodeClassOf(node: GraphNode): string {
-  if (node.commentableLines.length > 0) return NODE_CLASS_COMMENTABLE;
-  return node.inDiff ? NODE_CLASS_IN_DIFF : NODE_CLASS_DEPENDENCY;
+  if (node.hasChangedLine) return NODE_CLASS_COMMENTABLE;
+  if (node.commentableLines.length > 0) return NODE_CLASS_IN_DIFF;
+  return NODE_CLASS_DEPENDENCY;
 }
 
 // htmlLabels: false でも mermaid は <br/> だけは改行として解釈するため、

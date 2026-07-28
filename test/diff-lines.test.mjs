@@ -105,23 +105,27 @@ describe('commentableLinesForRange', () => {
     const r = commentableLinesForRange(info, 11, 14);
     assert.deepEqual(r.lines, [11, 12, 13, 14]);
     assert.equal(r.commentLine, 12);
+    assert.equal(r.hasChange, true, '追加行を含むので変更あり');
   });
 
-  test('範囲内に追加行がなければ最初のコメント可能行（文脈行）にフォールバック', () => {
+  test('範囲内に追加行がなければ最初のコメント可能行（文脈行）にフォールバックし、hasChange は false（差分なしだがコメント可）', () => {
     const r = commentableLinesForRange(info, 10, 11);
     assert.deepEqual(r.lines, [10, 11]);
     assert.equal(r.commentLine, 10);
+    assert.equal(r.hasChange, false);
   });
 
-  test('範囲と重なる行がなければ lines は空で commentLine は undefined', () => {
+  test('範囲と重なる行がなければ lines は空で commentLine は undefined、hasChange も false', () => {
     const r = commentableLinesForRange(info, 20, 25);
     assert.deepEqual(r.lines, []);
     assert.equal(r.commentLine, undefined);
+    assert.equal(r.hasChange, false);
   });
 
   test('範囲の両端（startLine / endLine）を含む', () => {
     const r = commentableLinesForRange(info, 30, 31);
     assert.deepEqual(r.lines, [30, 31]);
     assert.equal(r.commentLine, 31);
+    assert.equal(r.hasChange, true);
   });
 });
