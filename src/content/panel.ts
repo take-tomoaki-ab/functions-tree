@@ -22,6 +22,7 @@ import { filterGraph } from './mermaid-source';
 import type { GraphRenderer, RenderHandle } from './mermaid-view';
 import type { SourceRow } from './source-diff';
 import { buildSourceRows, diffStat } from './source-diff';
+import { splitSourceSegments } from './source-segments';
 import {
   anchoredScroll,
   clampZoom,
@@ -448,6 +449,24 @@ const PANEL_CSS = `
   .source .tok-function { color: #d2a8ff; }
   .source .tok-type { color: #ffa657; }
 }
+/* 識別子の選択（issue #22）: クリックで選ぶと同名の識別子がまとめて塗られ、
+   その識別子を使っている場所が一目で分かる。
+   outline はレイアウトに影響しないので、行の高さを変えずに囲める */
+.source .ident { cursor: pointer; border-radius: 2px; }
+.source .ident:hover { background: rgba(84, 174, 255, 0.25); }
+.source .ident-selected,
+.source .ident-selected:hover {
+  background: rgba(255, 212, 0, 0.45);
+  outline: 1px solid rgba(154, 103, 0, 0.7);
+}
+@media (prefers-color-scheme: dark) {
+  .source .ident:hover { background: rgba(56, 139, 253, 0.3); }
+  .source .ident-selected,
+  .source .ident-selected:hover {
+    background: rgba(187, 128, 9, 0.45);
+    outline: 1px solid rgba(240, 183, 60, 0.7);
+  }
+}
 .comment-label {
   display: block;
   margin: 0 0 4px;
@@ -791,6 +810,9 @@ let currentGraph: FunctionGraph | null = null;
 /** 解析に使った head コミット SHA（コメント投稿の commit_id に使う） */
 let currentHeadSha: string | null = null;
 let selectedNode: GraphNode | null = null;
+// コード表示でクリック選択されている識別子名（null = 未選択）。
+// 同名の識別子をまとめてハイライトするために、ノードを切り替えても保持する
+let selectedIdentifier: string | null = null;
 let renderHandle: RenderHandle | null = null;
 // パネル内のグラフ領域とサイドペインの間の区切りバー、およびその親コンテナ
 let mainEl: HTMLElement | null = null;
@@ -1630,8 +1652,9 @@ function buildDiffStat(rows: SourceRow[]): HTMLElement | null {
 }
 
 /**
- * 1 行分のテキストをハイライトトークンに沿って span に分割し親要素へ流し込む。
- * トークン間の隙間（識別子・記号・空白）は無装飾のテキストノードで出す。
+ * 1 行分のテキストをセグメントごとに span へ分割し親要素へ流し込む。
+ * 識別子は `.ident`（data-ident に名前）にしてクリックで選択できるようにし、
+ * 記号・空白は無装飾のテキストノードで出す。
  * innerHTML は使わない（sourceText はリポジトリ由来の任意文字列）。
  */
 function renderHighlightedSource(
@@ -1639,18 +1662,49 @@ function renderHighlightedSource(
   text: string,
   tokens: HighlightToken[]
 ): void {
-  let pos = 0;
-  for (const [start, end, kind] of tokens) {
-    // 範囲外・逆順のトークンは無視して残りを素のテキストで出す（描画を壊さない）
-    if (start < pos || end > text.length || start >= end) continue;
-    if (start > pos) code.append(text.slice(pos, start));
+  for (const seg of splitSourceSegments(text, tokens)) {
+    if (seg.kind === undefined && seg.identifier !== true) {
+      code.append(seg.text);
+      continue;
+    }
     const span = document.createElement('span');
-    span.className = `tok-${kind}`;
-    span.textContent = text.slice(start, end);
+    if (seg.kind !== undefined) span.classList.add(`tok-${seg.kind}`);
+    if (seg.identifier === true) {
+      span.classList.add('ident');
+      span.dataset.ident = seg.text;
+    }
+    span.textContent = seg.text;
     code.appendChild(span);
-    pos = end;
   }
-  if (pos < text.length) code.append(text.slice(pos));
+}
+
+/**
+ * 選択中の識別子に一致する `.ident` へ `.ident-selected` を付け直す。
+ * 未選択（null）なら全解除。
+ */
+function applyIdentifierSelection(code: HTMLElement): void {
+  for (const el of code.querySelectorAll<HTMLElement>('.ident')) {
+    el.classList.toggle('ident-selected', el.dataset.ident === selectedIdentifier);
+  }
+}
+
+/**
+ * コード表示内の識別子クリックで選択 / 解除する（issue #22）。
+ * 選択すると同名の識別子すべてがハイライトされ、どこで使われているか一目で分かる。
+ * - 識別子をクリック: 選択（同じものを再クリックすると解除）
+ * - 識別子以外（記号・空白・行番号）をクリック: 解除
+ * 選択はノードを切り替えても保つので、別の関数へ移っても追い続けられる。
+ */
+function attachIdentifierSelection(code: HTMLElement): void {
+  code.addEventListener('click', (event) => {
+    // コピー目的のドラッグ（テキスト選択）では識別子の選択を変えない
+    const textSelection = code.ownerDocument.getSelection();
+    if (textSelection !== null && !textSelection.isCollapsed) return;
+    const target = event.target;
+    const name = target instanceof HTMLElement ? target.dataset.ident : undefined;
+    selectedIdentifier = name !== undefined && name !== selectedIdentifier ? name : null;
+    applyIdentifierSelection(code);
+  });
 }
 
 /** サイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）を描画する */
@@ -1686,6 +1740,9 @@ function renderNodeDetail(node: GraphNode): void {
   source.className = 'source';
   const code = document.createElement('code');
   renderSourceRows(code, rows);
+  attachIdentifierSelection(code);
+  // 再描画（ノード切り替え・下書き更新）をまたいで識別子の選択を保つ
+  applyIdentifierSelection(code);
   source.appendChild(code);
 
   const commentArea = document.createElement('div');
@@ -1981,6 +2038,7 @@ function openPanel(): void {
   // パネルを開くたびにフィルタ・選択状態・倍率は初期値に戻す
   graphFilter = { connectedOnly: true, inDiffOnly: false };
   selectedNode = null;
+  selectedIdentifier = null;
   currentGraph = null;
   currentHeadSha = null;
   renderHandle = null;
@@ -2040,6 +2098,7 @@ function closePanel(): void {
   currentGraph = null;
   currentHeadSha = null;
   selectedNode = null;
+  selectedIdentifier = null;
   renderHandle = null;
   zoomLevel = 1;
   zoomUiUpdater = null;

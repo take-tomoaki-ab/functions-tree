@@ -66,6 +66,10 @@
 // - リサイズした幅が chrome.storage.local に保存され、パネルを閉じて
 //   開き直しても復元される
 //
+// feat/issue-22-identifier-select で追加した確認項目:
+// - コード表示の識別子（`.ident`）をクリックすると選択され、同名の識別子すべてが
+//   ハイライト（`.ident-selected`）される。もう一度クリックすると解除される
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -630,6 +634,67 @@ try {
       `追加行を持つコメント可能ノードが見つからない（commentable=${commentableTotal}）`
     );
   }
+
+  // === feat/issue-22-identifier-select ===
+  // 6.3c. コード表示の識別子をクリックで選択でき、同名の識別子がまとめて
+  //       ハイライトされること（もう一度クリックすると解除される）。
+  const IDENT = '#functions-tree-panel-host .source code .ident';
+  // 2 回以上出てくる識別子を選ぶ（「同じ識別子がハイライトされる」ことを確認するため）
+  const repeated = await page.evaluate(() => {
+    const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+    const counts = new Map();
+    for (const el of shadow?.querySelectorAll('.source code .ident') ?? []) {
+      const name = el.dataset.ident ?? '';
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const best = [...counts.entries()].sort((a, b) => b[1] - a[1])[0];
+    return { total: counts.size, name: best?.[0] ?? '', count: best?.[1] ?? 0 };
+  });
+  const readIdentSelection = () =>
+    page.evaluate(() => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      const selected = [...(shadow?.querySelectorAll('.source code .ident-selected') ?? [])];
+      const plain = shadow?.querySelector('.source code .ident:not(.ident-selected)');
+      return {
+        selectedCount: selected.length,
+        names: [...new Set(selected.map((el) => el.dataset.ident ?? ''))],
+        // 見た目にも差が出ていること（選択色が実際に効いている）
+        selectedBg: selected[0] ? getComputedStyle(selected[0]).backgroundColor : '',
+        plainBg: plain ? getComputedStyle(plain).backgroundColor : '',
+        cursor: plain ? getComputedStyle(plain).cursor : '',
+      };
+    });
+  if (repeated.count >= 2) {
+    const targets = page.locator(`${IDENT}[data-ident="${repeated.name}"]`);
+    await targets.first().click();
+    const identOn = await readIdentSelection();
+    record(
+      'code identifier: click selects it and highlights every occurrence',
+      identOn.selectedCount === repeated.count &&
+        identOn.names.length === 1 && identOn.names[0] === repeated.name &&
+        identOn.selectedBg !== identOn.plainBg &&
+        identOn.selectedBg !== 'rgba(0, 0, 0, 0)' &&
+        identOn.cursor === 'pointer',
+      `ident="${repeated.name}" occurrences=${repeated.count} selected=${identOn.selectedCount} ` +
+        `bg=${identOn.selectedBg} plainBg=${identOn.plainBg} cursor=${identOn.cursor}`
+    );
+    await shot(page, '5b2-identifier-selected');
+    // 同じ識別子を再クリックすると選択解除される
+    await targets.first().click();
+    const identOff = await readIdentSelection();
+    record(
+      'code identifier: clicking the selected identifier again clears the highlight',
+      identOff.selectedCount === 0,
+      `selected=${identOff.selectedCount}`
+    );
+  } else {
+    record(
+      'code identifier: click selects it and highlights every occurrence',
+      false,
+      `2 回以上出てくる識別子が見つからない（識別子の種類=${repeated.total}）`
+    );
+  }
+
   // 以降のコメント欄確認のためコメント可能ノードを選び直す
   await commentableNodes.first().click();
 
