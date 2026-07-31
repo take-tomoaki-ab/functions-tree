@@ -7,6 +7,8 @@ import { describe, test } from 'node:test';
 
 import {
   buildSourceRows,
+  computeDiffHunks,
+  computeDiffMarks,
   diffStat,
   splitTokensByLine,
 } from '../dist-test/source-diff.mjs';
@@ -179,5 +181,80 @@ describe('diffStat', () => {
   test('無変更の関数は 0 件（サマリを出さない判定に使う）', () => {
     const rows = buildSourceRows({ sourceText: 'a\nb', startLine: 1 });
     assert.deepEqual(diffStat(rows), { added: 0, deleted: 0 });
+  });
+});
+
+// issue #25: 差分ナビゲーション（次/前の差分ボタン）が飛び先とする hunk 単位
+describe('computeDiffHunks', () => {
+  test('無変更の関数には hunk がない', () => {
+    const rows = buildSourceRows({ sourceText: 'a\nb', startLine: 1 });
+    assert.deepEqual(computeDiffHunks(rows), []);
+  });
+
+  test('context で区切られた add/del はそれぞれ別の hunk になる', () => {
+    const rows = buildSourceRows({
+      sourceText: 'a\nb\nc\nd\ne',
+      startLine: 1,
+      addedLines: [2, 4],
+    });
+    assert.deepEqual(computeDiffHunks(rows), [
+      { startRow: 1, endRow: 2 },
+      { startRow: 3, endRow: 4 },
+    ]);
+  });
+
+  test('削除→追加（同じ変更）は 1 つの hunk にまとまる', () => {
+    const rows = buildSourceRows({
+      sourceText: 'a\nb\nc',
+      startLine: 1,
+      addedLines: [2],
+      deletedLines: [{ beforeLine: 2, text: 'old b' }],
+    });
+    // rows = [context a, del, add, context c]
+    assert.deepEqual(computeDiffHunks(rows), [{ startRow: 1, endRow: 3 }]);
+  });
+
+  test('新規追加された関数は全行が 1 つの hunk になる', () => {
+    const rows = buildSourceRows({
+      sourceText: 'a\nb\nc',
+      startLine: 1,
+      addedLines: [1, 2, 3],
+    });
+    assert.deepEqual(computeDiffHunks(rows), [{ startRow: 0, endRow: 3 }]);
+  });
+});
+
+// issue #25: overview ruler（VSCode のスクロールバー横インジケータ）用のマーク
+describe('computeDiffMarks', () => {
+  test('行がなければ空', () => {
+    assert.deepEqual(computeDiffMarks([]), []);
+  });
+
+  test('無変更ならマークなし', () => {
+    const rows = buildSourceRows({ sourceText: 'a\nb', startLine: 1 });
+    assert.deepEqual(computeDiffMarks(rows), []);
+  });
+
+  test('add/del は隣接していても種別ごとに別マークになり、比率は行位置に対応する', () => {
+    const rows = buildSourceRows({
+      sourceText: 'a\nb\nc',
+      startLine: 1,
+      addedLines: [2],
+      deletedLines: [{ beforeLine: 2, text: 'old b' }],
+    });
+    // rows = [context a, del, add, context c] → 4 行中、del=1/4〜2/4, add=2/4〜3/4
+    assert.deepEqual(computeDiffMarks(rows), [
+      { kind: 'del', startRatio: 0.25, endRatio: 0.5 },
+      { kind: 'add', startRatio: 0.5, endRatio: 0.75 },
+    ]);
+  });
+
+  test('連続する追加行はまとめて 1 マークになる', () => {
+    const rows = buildSourceRows({
+      sourceText: 'a\nb\nc\nd',
+      startLine: 1,
+      addedLines: [2, 3],
+    });
+    assert.deepEqual(computeDiffMarks(rows), [{ kind: 'add', startRatio: 0.25, endRatio: 0.75 }]);
   });
 });
