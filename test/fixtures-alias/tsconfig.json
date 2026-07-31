@@ -1,0 +1,10 @@
+{
+  // Next.js 風の paths エイリアス（JSONC なのでコメント・末尾カンマ入り）
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "~components/*": ["./src/components/*"],
+    },
+  },
+}

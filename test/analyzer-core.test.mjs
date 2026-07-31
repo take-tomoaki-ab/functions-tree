@@ -33,33 +33,36 @@ before(async () => {
   });
 });
 
-/** フィクスチャディレクトリをリポジトリに見立てたファイル取得 */
-async function fetchFixture(path) {
-  try {
-    const content = await readFile(join(fixturesDir, path), 'utf8');
-    return { ok: true, content };
-  } catch {
-    return { ok: false, reason: 'not_found' };
-  }
+/**
+ * フィクスチャディレクトリをリポジトリのルートに見立てた取得手段。
+ * listDir は SW の contents API 相当（候補をこれで絞って 404 プローブを避ける = issue #27 A）
+ */
+function fixtureIO(root) {
+  return {
+    fetchFile: async (path) => {
+      try {
+        return { ok: true, content: await readFile(join(root, path), 'utf8') };
+      } catch {
+        return { ok: false, reason: 'not_found' };
+      }
+    },
+    listDir: async (dir) => {
+      try {
+        const entries = await readdir(join(root, dir), { withFileTypes: true });
+        return {
+          ok: true,
+          paths: entries
+            .filter((e) => e.isFile())
+            .map((e) => (dir === '' ? e.name : `${dir}/${e.name}`)),
+        };
+      } catch {
+        return { ok: false, reason: 'not_found' };
+      }
+    },
+  };
 }
 
-/**
- * ディレクトリ一覧（SW の contents API 相当）。
- * import 候補をこれで絞ることで 404 プローブの fetch 予算消費を避ける（issue #27 A）
- */
-async function listFixtureDir(dir) {
-  try {
-    const entries = await readdir(join(fixturesDir, dir), { withFileTypes: true });
-    return {
-      ok: true,
-      paths: entries
-        .filter((e) => e.isFile())
-        .map((e) => (dir === '' ? e.name : `${dir}/${e.name}`)),
-    };
-  } catch {
-    return { ok: false, reason: 'not_found' };
-  }
-}
+const { fetchFile: fetchFixture, listDir: listFixtureDir } = fixtureIO(fixturesDir);
 
 /** 変更ファイルはパス文字列 or { path, patch } で指定できるようにする */
 async function buildFixtureGraph(changedFiles, options) {
@@ -68,6 +71,17 @@ async function buildFixtureGraph(changedFiles, options) {
     listDir: listFixtureDir,
     ...options,
   });
+}
+
+/** tsconfig paths を持つ別リポジトリ（test/fixtures-alias）でグラフを組む（issue #28 G） */
+async function buildAliasGraph(changedFiles, options) {
+  const io = fixtureIO(join(__dirname, 'fixtures-alias'));
+  return buildGraph(
+    analyzer,
+    changedFiles.map((path) => ({ path })),
+    io.fetchFile,
+    { listDir: io.listDir, ...options }
+  );
 }
 
 const findNode = (graph, name) => graph.nodes.find((n) => n.name === name);
@@ -530,8 +544,9 @@ describe('issue #27: 連結の安定性', () => {
       { listDir: countingList }
     );
     assert.equal(graph.analyzedFiles.length, 7, '親 + 子 6 件');
-    // 親 1 + 子 6 = 7 回のファイル取得。404 プローブは 0 回
-    assert.equal(fetches, 7);
+    // 親 1 + 子 6 = 7 回のファイル取得 + tsconfig.json 1 回（issue #28 G の prepare）。
+    // 404 プローブは 0 回
+    assert.equal(fetches, 8);
     // many/ と many/cN の 7 ディレクトリ。同じディレクトリは 1 回だけ
     assert.equal(listings, 7);
   });
@@ -599,6 +614,162 @@ describe('issue #27: 連結の安定性', () => {
     assert.equal(a.functions.find((f) => f.name === 'render').isNested, false);
     const graph = await buildFixtureGraph(['app.ts']);
     assert.ok(hasEdge(graph, 'main', 'render'));
+  });
+});
+
+describe('issue #28: 検知漏れパターン', () => {
+  describe('D: barrel / re-export の解決', () => {
+    test('名前付き re-export・export * ・多段 barrel のいずれでも親子が連結される', async () => {
+      const graph = await buildFixtureGraph(['barrel/parent.tsx']);
+      assert.ok(hasEdge(graph, 'Parent', 'Card'), "export { Card } from './card'");
+      assert.ok(hasEdge(graph, 'Parent', 'Badge'), "export * from './badge'");
+      assert.ok(hasEdge(graph, 'Parent', 'Chip'), 'barrel → barrel → 実体');
+    });
+
+    test('barrel は深さに数えないので、深さ 1 のまま実体まで届く', async () => {
+      const graph = await buildFixtureGraph(['barrel/parent.tsx']);
+      assert.deepEqual(
+        [...graph.analyzedFiles].sort(),
+        [
+          'barrel/components/badge.tsx',
+          'barrel/components/card.tsx',
+          'barrel/components/chip/chip.tsx',
+          'barrel/components/chip/index.ts',
+          'barrel/components/index.ts',
+          'barrel/parent.tsx',
+        ]
+      );
+      assert.deepEqual(graph.skippedFiles, []);
+      assert.equal(graph.unresolvedCallCount, 0);
+    });
+
+    test('barrel の型だけの re-export は依存として取得しない', async () => {
+      const graph = await buildFixtureGraph(['barrel/parent.tsx']);
+      assert.ok(!graph.analyzedFiles.includes('barrel/components/props.ts'));
+    });
+
+    test('re-export は reExports として抽出され、自ファイルの関数にはならない', async () => {
+      const path = 'barrel/components/index.ts';
+      const a = analyzer.analyzeFile(path, (await fetchFixture(path)).content);
+      assert.deepEqual(a.functions, [], 'barrel 自身は関数を持たない');
+      assert.deepEqual(a.reExports, [
+        { exported: 'Card', imported: 'Card', source: './card', typeOnly: false },
+        { exported: '*', imported: '*', source: './badge', typeOnly: false },
+        { exported: '*', imported: '*', source: './chip', typeOnly: false },
+        {
+          exported: 'CardProps',
+          imported: 'CardProps',
+          source: './props',
+          typeOnly: true,
+        },
+      ]);
+    });
+
+    test('dependencyDepth: 0 なら barrel も辿らない', async () => {
+      const graph = await buildFixtureGraph(['barrel/parent.tsx'], {
+        dependencyDepth: 0,
+      });
+      assert.deepEqual(graph.analyzedFiles, ['barrel/parent.tsx']);
+    });
+  });
+
+  describe('E: HOC / memo / forwardRef ラップ', () => {
+    test('memo / forwardRef / HOC ラップの子がノード化されエッジが張られる', async () => {
+      const graph = await buildFixtureGraph(['wrap/parent.tsx']);
+      assert.ok(hasEdge(graph, 'Parent', 'Card'), 'memo(function ...)');
+      assert.ok(hasEdge(graph, 'Parent', 'Input'), 'forwardRef((p, ref) => ...)');
+      assert.ok(
+        hasEdge(graph, 'Parent', 'Panel'),
+        'export default withRouter(Panel)（識別子を包む HOC）'
+      );
+    });
+
+    test('export default memo(Card) 形式は包まれた識別子に default が付く', async () => {
+      const path = 'wrap/panel.tsx';
+      const a = analyzer.analyzeFile(path, (await fetchFixture(path)).content);
+      assert.equal(a.functions.find((f) => f.name === 'Panel').exportName, 'default');
+    });
+
+    test('ラップされた関数本体の呼び出しはラップ側のノードに帰属する', async () => {
+      const graph = await buildFixtureGraph(['wrap/parent.tsx', 'wrap/card.tsx']);
+      assert.ok(hasEdge(graph, 'Card', 'Row'), 'memo で包んだ本体の <Row /> も辿れる');
+      assert.equal(graph.unresolvedCallCount, 0);
+    });
+
+    test('関数を包まない呼び出し・大文字定数はノード化しない', async () => {
+      const path = 'wrap/plain.ts';
+      const a = analyzer.analyzeFile(path, (await fetchFixture(path)).content);
+      assert.deepEqual(
+        a.functions.map((f) => f.name),
+        ['createConfig'],
+        'Config（オブジェクト内のコールバック）も EXTENSIONS（定数）も関数ではない'
+      );
+    });
+
+    test('小文字始まりの高階呼び出しは従来どおり外側の関数に帰属する（回帰）', async () => {
+      const a = analyzer.analyzeFile('app.ts', (await fetchFixture('app.ts')).content);
+      const render = a.functions.find((f) => f.name === 'render');
+      assert.ok(
+        render.calls.some((c) => c.callee === 'toUpper'),
+        'items.map((n) => toUpper(...)) は render に帰属したまま'
+      );
+      assert.ok(!a.functions.some((f) => f.name === 'items'));
+    });
+  });
+
+  describe('F: class コンポーネント', () => {
+    test('class 名でノード化され、<Panel /> が解決される', async () => {
+      const graph = await buildFixtureGraph(['cls/parent.tsx']);
+      const parent = findNode(graph, 'Parent');
+      assert.equal(parent.kind, 'class_declaration');
+      assert.equal(parent.exportName, 'Parent', 'export class Foo');
+      const panel = findNode(graph, 'Panel');
+      assert.equal(panel.exportName, 'default', 'export default class Foo');
+      assert.ok(hasEdge(graph, 'Parent', 'Panel'));
+    });
+
+    test('render() の呼び出しは class ノードに帰属し、render ノードは作られない', async () => {
+      const graph = await buildFixtureGraph(['cls/parent.tsx', 'cls/panel.tsx']);
+      assert.ok(!findNode(graph, 'render'), 'render ノードは class に畳まれる');
+      assert.ok(hasEdge(graph, 'Panel', 'Card'), 'render 内の <Card /> は Panel の子');
+    });
+
+    test('render 以外のメソッドは従来どおり独立ノードで this 呼び出しも解決される', async () => {
+      const graph = await buildFixtureGraph(['cls/parent.tsx']);
+      const helper = findNode(graph, 'helper');
+      assert.equal(helper.kind, 'method_definition');
+      assert.ok(hasEdge(graph, 'Parent', 'helper'), 'render 内の this.helper()');
+    });
+
+    test('コンポーネントでない class もノード化されるがメソッドは残る（回帰）', async () => {
+      const graph = await buildFixtureGraph(['store.ts'], { dependencyDepth: 0 });
+      assert.equal(findNode(graph, 'Cache').kind, 'class_declaration');
+      assert.ok(hasEdge(graph, 'refresh', 'load'), 'this.load() は従来どおり');
+    });
+  });
+
+  describe('G: tsconfig paths エイリアス', () => {
+    test('@/* エイリアスの import で親子が連結される', async () => {
+      const graph = await buildAliasGraph(['src/app/page.tsx']);
+      assert.ok(hasEdge(graph, 'Page', 'Card'), '@/components/Card');
+      assert.ok(hasEdge(graph, 'Page', 'Badge'), '~components/Badge');
+      assert.deepEqual(graph.skippedFiles, []);
+    });
+
+    test('エイリアスに当たらない外部パッケージは取得しない', async () => {
+      const graph = await buildAliasGraph(['src/app/page.tsx']);
+      assert.deepEqual(
+        [...graph.analyzedFiles].sort(),
+        ['src/app/page.tsx', 'src/components/Badge.tsx', 'src/components/Card.tsx']
+      );
+    });
+
+    test('tsconfig.json が無いリポジトリでは非相対 import を解決しない（回帰）', async () => {
+      // test/fixtures には tsconfig.json が無い。'react' 等は候補 0 件で取得されない
+      const graph = await buildFixtureGraph(['wrap/card.tsx']);
+      assert.ok(!graph.analyzedFiles.some((p) => p.includes('react')));
+      assert.deepEqual(graph.skippedFiles, []);
+    });
   });
 });
 

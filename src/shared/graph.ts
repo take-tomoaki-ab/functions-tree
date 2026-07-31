@@ -44,7 +44,7 @@ export interface GraphNode {
   /** 1 始まりの行範囲（宣言全体） */
   startLine: number;
   endLine: number;
-  /** function_declaration | variable_declarator | method_definition */
+  /** function_declaration | variable_declarator | method_definition | class_declaration */
   kind: string;
   /**
    * PR の変更ファイル内の関数なら true（ファイル単位の判定）。
