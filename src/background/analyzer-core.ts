@@ -56,8 +56,16 @@ export const DEFAULT_MAX_CHANGED_FILES = 30;
 /** 深さ 1 で追加取得する依存ファイル数の上限（レート制限保護） */
 export const DEFAULT_MAX_DEPENDENCY_FILES = 20;
 
-/** 依存解決のための fetch 試行回数の上限。候補パスの 404 やディレクトリ一覧も 1 回に数える */
-export const DEFAULT_MAX_DEPENDENCY_FETCHES = 40;
+/**
+ * 依存解決のための fetch 試行回数の上限。候補パスの 404 やディレクトリ一覧も 1 回に数える。
+ *
+ * issue #27 A でディレクトリ一覧による絞り込みを入れたため、依存 1 件あたりの消費は
+ * 「ディレクトリ一覧（同一ディレクトリなら使い回し）＋ 実ファイル 1 回」に減った。
+ * 最悪ケース（依存 20 件がすべて別ディレクトリで、かつ `./x` → `x/index.tsx` 形式）でも
+ * 20 件 × (一覧 2 + 取得 1) = 60 に収まるので、実質の上限を
+ * maxDependencyFiles（20）側に一本化する狙いで 40 → 60 にしている。
+ */
+export const DEFAULT_MAX_DEPENDENCY_FETCHES = 60;
 
 export function isAnalyzablePath(path: string): boolean {
   return languageForPath(path) !== undefined;
@@ -254,6 +262,65 @@ export async function buildGraph(
   // 取得済み / 取得失敗のディレクトリ一覧（同一ディレクトリの重複リクエスト防止）
   const listedDirs = new Map<string, string[]>();
   const requestedDirs = new Set<string>();
+  // fetch 予算切れで諦めたパス（同じパスを何度も skipped に積まないための重複排除）
+  const fetchLimited = new Set<string>();
+
+  /** 予算切れで依存を辿れなかったことを記録する（issue #27 B） */
+  const noteFetchLimit = (path: string): void => {
+    if (fetchLimited.has(path)) return;
+    fetchLimited.add(path);
+    skipped.push({ path, reason: 'dependency_fetch_limit' });
+  };
+
+  /**
+   * ディレクトリ直下のファイル一覧（1 ディレクトリにつき 1 回だけ取得してキャッシュ）。
+   * 存在しないディレクトリは [] を返す。null は「一覧が取れなかった」
+   * （listDir 未提供 / エラー / 予算切れ）で、呼び出し側は候補プローブに退避する。
+   */
+  const listDirFiles = async (dir: string): Promise<string[] | null> => {
+    const cached = listedDirs.get(dir);
+    if (cached !== undefined) return cached;
+    if (requestedDirs.has(dir)) return null; // 取得を試みて失敗済み
+    if (!options.listDir) return null;
+    requestedDirs.add(dir);
+    if (dependencyFetches >= maxDependencyFetches) {
+      noteFetchLimit(dir);
+      return null;
+    }
+    dependencyFetches++;
+    const r = await options.listDir(dir);
+    if (!r.ok) {
+      // ディレクトリが無いのは候補の探索として普通なので静かに「空」として扱う
+      if (r.reason === 'not_found') {
+        listedDirs.set(dir, []);
+        return [];
+      }
+      skipped.push({ path: dir, reason: r.reason });
+      return null;
+    }
+    listedDirs.set(dir, r.paths);
+    return r.paths;
+  };
+
+  /**
+   * 候補パスをディレクトリ一覧で実在するものだけに絞る（issue #27 A）。
+   * 拡張子なし import は候補が 10 個あり、404 プローブが fetch 予算を食い潰して
+   * 「import 順によって連結されたりされなかったり」の原因になっていた。
+   * 一覧が取れないディレクトリが 1 つでもあれば、従来どおり全候補をプローブする。
+   */
+  const narrowCandidates = async (candidates: string[]): Promise<string[]> => {
+    const narrowed: string[] = [];
+    for (const candidate of candidates) {
+      const files = await listDirFiles(dirnameOf(candidate));
+      if (files === null) {
+        // 予算切れならプローブしても無駄（listDirFiles 側で記録済み）。
+        // それ以外（listDir 未提供・エラー）は従来どおり全候補を試す
+        return dependencyFetches >= maxDependencyFetches ? [] : candidates;
+      }
+      if (files.includes(candidate)) narrowed.push(candidate);
+    }
+    return narrowed;
+  };
 
   for (let d = 0; d < depth; d++) {
     const added: FileAnalysis[] = [];
@@ -291,8 +358,14 @@ export async function buildGraph(
             skipped.push({ path: target.candidates[0], reason: 'dependency_limit' });
             continue;
           }
-          for (const candidate of target.candidates) {
-            if (dependencyFetches >= maxDependencyFetches) break;
+          const candidates = options.listDir
+            ? await narrowCandidates(target.candidates)
+            : target.candidates;
+          for (const candidate of candidates) {
+            if (dependencyFetches >= maxDependencyFetches) {
+              noteFetchLimit(candidate);
+              break;
+            }
             dependencyFetches++;
             const r = await fetchFile(candidate);
             if (!r.ok) {
@@ -318,26 +391,13 @@ export async function buildGraph(
           }
         } else {
           // ディレクトリ内の対象ファイルすべて（Go のパッケージ）
-          if (requestedDirs.has(target.dir) && !listedDirs.has(target.dir)) continue;
-          let paths = listedDirs.get(target.dir);
-          if (paths === undefined) {
+          if (!options.listDir && !requestedDirs.has(target.dir)) {
             requestedDirs.add(target.dir);
-            if (!options.listDir) {
-              skipped.push({ path: target.dir, reason: 'dir_listing_unavailable' });
-              continue;
-            }
-            if (dependencyFetches >= maxDependencyFetches) continue;
-            dependencyFetches++;
-            const r = await options.listDir(target.dir);
-            if (!r.ok) {
-              if (r.reason !== 'not_found') {
-                skipped.push({ path: target.dir, reason: r.reason });
-              }
-              continue;
-            }
-            paths = r.paths;
-            listedDirs.set(target.dir, paths);
+            skipped.push({ path: target.dir, reason: 'dir_listing_unavailable' });
+            continue;
           }
+          const paths = await listDirFiles(target.dir);
+          if (paths === null) continue;
           for (const p of paths) {
             if (analyzed.has(p)) continue;
             const pDef = languageForPath(p);
@@ -347,7 +407,10 @@ export async function buildGraph(
               skipped.push({ path: p, reason: 'dependency_limit' });
               continue;
             }
-            if (dependencyFetches >= maxDependencyFetches) break;
+            if (dependencyFetches >= maxDependencyFetches) {
+              noteFetchLimit(p);
+              break;
+            }
             dependencyFetches++;
             await analyzeDependency(p);
           }
@@ -377,6 +440,7 @@ function assembleGraph(
 
   for (const [path, analysis] of analyzed) {
     const topLevel = new Map<string, FunctionInfo>();
+    const nested = new Map<string, FunctionInfo>();
     const methods = new Map<string, FunctionInfo[]>();
     const exports = new Map<string, FunctionInfo>();
     const patchLines = patchLinesByPath.get(path);
@@ -417,6 +481,9 @@ function assembleGraph(
         const list = methods.get(callName) ?? [];
         list.push(fn);
         methods.set(callName, list);
+      } else if (fn.isNested) {
+        // ネスト定義はトップレベル・import より弱い候補として別表に分ける（issue #27 C）
+        if (!nested.has(callName)) nested.set(callName, fn);
       } else {
         // 同名の再宣言（オーバーロード実装等）は最初の定義を採用
         if (!topLevel.has(callName)) topLevel.set(callName, fn);
@@ -425,7 +492,7 @@ function assembleGraph(
         exports.set(fn.exportName, fn);
       }
     }
-    tables.set(path, { analysis, topLevel, methods, exports });
+    tables.set(path, { analysis, topLevel, nested, methods, exports });
     const dir = dirnameOf(path);
     dirIndex.set(dir, [...(dirIndex.get(dir) ?? []), path]);
   }

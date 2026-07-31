@@ -25,6 +25,12 @@ export interface FunctionInfo {
   kind: string;
   /** メソッド（レシーバ / self 付き）なら true */
   isMethod?: boolean;
+  /**
+   * 他の関数の内側で定義された関数なら true（issue #27）。
+   * ネストした同名定義が import を shadow して誤エッジを張るのを防ぐため、
+   * 呼び出し解決ではトップレベル定義・import より後ろに回す。
+   */
+  isNested?: boolean;
   /** 1 始まりの行範囲（宣言全体。デコレータ含む） */
   startLine: number;
   endLine: number;
@@ -50,6 +56,8 @@ export interface ImportBinding {
   source: string;
   /** import 先での名前。default import は 'default'、モジュール全体は '*' */
   imported: string;
+  /** 型だけの import（`import type` / `import { type X }`）なら true。依存取得の対象外 */
+  typeOnly?: boolean;
 }
 
 export interface FileAnalysis {
@@ -82,8 +90,10 @@ export interface ResolvedCall {
 /** 解析済みファイル 1 つ分の解決テーブル（analyzer-core の assembleGraph が構築する） */
 export interface FileTables {
   analysis: FileAnalysis;
-  /** callName → 非メソッド関数（同名は最初の定義） */
+  /** callName → 非メソッドのトップレベル関数（同名は最初の定義） */
   topLevel: Map<string, FunctionInfo>;
+  /** callName → 他の関数の内側で定義された関数（isNested）。同名は最初の定義 */
+  nested: Map<string, FunctionInfo>;
   /** callName → メソッド（同名は全部。曖昧さの判定に使う） */
   methods: Map<string, FunctionInfo[]>;
   /** exportName → 関数（同名は最初の定義） */
