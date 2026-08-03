@@ -17,6 +17,7 @@ import { sendToBackground } from '../shared/messages';
 import { getSidePaneWidth, setSidePaneWidth } from '../shared/panel-prefs';
 import { draftNodeIds, findCommentForNode } from '../shared/review-drafts';
 import { getPat, PAT_KEY } from '../shared/settings';
+import { createDiffNav } from './diff-nav';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
 import type { GraphRenderer, RenderHandle } from './mermaid-view';
@@ -491,6 +492,12 @@ const PANEL_CSS = `
   .src-line.src-del { background: rgba(248, 81, 73, 0.15); }
   .src-line.src-del .src-marker { color: #f85149; }
   .src-line.src-del .src-content { color: #ffa198; }
+}
+/* 差分ナビで選択中の hunk（issue #25）。末尾付近の hunk は選択してもスクロール位置が
+   上限でクランプされて画面が動かないので、左端のアクセントで現在位置を示す */
+.src-line.hunk-active { box-shadow: inset 2px 0 0 #0969da; }
+@media (prefers-color-scheme: dark) {
+  .src-line.hunk-active { box-shadow: inset 2px 0 0 #4493f8; }
 }
 /* 追加 / 削除の行数サマリ（詳細タイトル横） */
 .diff-stat {
@@ -1809,21 +1816,20 @@ function hunkScrollTop(source: HTMLElement, code: HTMLElement, hunk: DiffHunk): 
 /**
  * 「次の差分へ」「前の差分へ」ボタンと現在位置カウンタ（issue #25）。
  * hunk 単位（context を挟まない add/del の連続区間）でジャンプする。
- * 現在位置は source の scrollTop から都度算出するので、ボタン操作だけでなく
- * 手動スクロールにも表示が追従する。両端は折り返す（最後の次へ → 最初に戻る）。
+ * 選択中の hunk は createDiffNav が状態として持ち（スクロール位置から逆算すると
+ * 末尾付近のクランプ域で先へ進めなくなる）、手動スクロールには syncToScroll で追従する。
+ * 両端は折り返す（最後の次へ → 最初に戻る）。
  */
-interface DiffNav {
+interface DiffNavUi {
   el: HTMLElement;
   /**
-   * カウンタの再計算。getBoundingClientRect に依存するため、el を DOM へ
-   * 接続した後に呼ぶこと（未接続だと全要素が top:0 になり、hunk 数-1 番目に
-   * 誤って留まる。build 時点ではまだ sidePaneEl に入っていないので、この
-   * 呼び出しは呼び出し側の責務にしている）
+   * カウンタと選択中 hunk のハイライトを描く。build 時点では code がまだ
+   * sidePaneEl に入っていないので、初期表示はこの呼び出しで行う（呼び出し側の責務）。
    */
   refresh: () => void;
 }
 
-function buildDiffNav(source: HTMLElement, code: HTMLElement, hunks: DiffHunk[]): DiffNav {
+function buildDiffNav(source: HTMLElement, code: HTMLElement, hunks: DiffHunk[]): DiffNavUi {
   const nav = document.createElement('div');
   nav.className = 'diff-nav';
 
@@ -1844,34 +1850,49 @@ function buildDiffNav(source: HTMLElement, code: HTMLElement, hunks: DiffHunk[])
   next.title = '次の差分へ';
   next.setAttribute('aria-label', '次の差分へ');
 
-  const scrollToHunk = (index: number): void => {
-    const top = Math.max(0, hunkScrollTop(source, code, hunks[index]) - 4);
-    source.scrollTo({ top, behavior: 'smooth' });
-  };
-  // 直近で開始位置を過ぎた hunk = 今見ている hunk とみなす（未到達なら先頭扱い）
-  const currentIndex = (): number => {
-    const top = source.scrollTop;
-    let idx = 0;
-    for (let i = 0; i < hunks.length; i++) {
-      if (hunkScrollTop(source, code, hunks[i]) <= top + 4) idx = i;
-      else break;
+  const state = createDiffNav(hunks.length, {
+    scrollTop: () => source.scrollTop,
+    maxScrollTop: () => source.scrollHeight - source.clientHeight,
+    hunkTop: (index) => hunkScrollTop(source, code, hunks[index]),
+  });
+
+  /**
+   * 選択中の hunk の行に目印を付ける。
+   * 末尾付近の hunk はスクロール位置が上限でクランプされて画面が動かないので、
+   * ここが「次へ / 前へ が効いた」ことを示す唯一の手掛かりになる。
+   */
+  const highlightActiveHunk = (): void => {
+    for (const el of code.querySelectorAll('.hunk-active')) {
+      el.classList.remove('hunk-active');
     }
-    return idx;
+    const hunk = hunks[state.index()];
+    for (let row = hunk.startRow; row < hunk.endRow; row++) {
+      code.children[row]?.classList.add('hunk-active');
+    }
   };
-  const updateCount = (): void => {
-    count.textContent = `${currentIndex() + 1} / ${hunks.length}`;
+  const refresh = (): void => {
+    count.textContent = state.label();
+    highlightActiveHunk();
   };
-  // 次/前は「今見ている hunk」（currentIndex）を基準に前後へ移動する（両端は折り返す）
-  prev.addEventListener('click', () => {
-    scrollToHunk((currentIndex() - 1 + hunks.length) % hunks.length);
-  });
-  next.addEventListener('click', () => {
-    scrollToHunk((currentIndex() + 1) % hunks.length);
-  });
-  source.addEventListener('scroll', updateCount, { passive: true });
+  // 移動先がクランプされて scroll イベントが起きないこともあるので、
+  // 表示の更新はスクロール完了待ちではなくクリック時点で行う
+  const goTo = (top: number): void => {
+    source.scrollTo({ top, behavior: 'smooth' });
+    refresh();
+  };
+  prev.addEventListener('click', () => goTo(state.prev()));
+  next.addEventListener('click', () => goTo(state.next()));
+  source.addEventListener(
+    'scroll',
+    () => {
+      state.syncToScroll();
+      refresh();
+    },
+    { passive: true }
+  );
 
   nav.append(prev, count, next);
-  return { el: nav, refresh: updateCount };
+  return { el: nav, refresh };
 }
 
 /** サイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）を描画する */

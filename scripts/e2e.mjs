@@ -652,6 +652,7 @@ try {
         hasNav: !!shadow?.querySelector('.diff-nav'),
         countText: (shadow?.querySelector('.diff-nav-count')?.textContent ?? '').trim(),
         scrollTop: source?.scrollTop ?? -1,
+        activeHunkRows: shadow?.querySelectorAll('.src-line.hunk-active').length ?? 0,
         marks: [...(shadow?.querySelectorAll('.diff-ruler-mark') ?? [])].map((el) => ({
           kind: el.classList.contains('mark-add') ? 'add' : 'del',
           color: getComputedStyle(el).backgroundColor,
@@ -665,8 +666,10 @@ try {
     record(
       'diff nav: prev/next buttons + counter + overview ruler shown for a changed function',
       navBefore.hasNav && countMatch !== null && Number(countMatch[1]) === 1 &&
+        navBefore.activeHunkRows > 0 &&
         !!addMark && addMark.color !== 'rgba(0, 0, 0, 0)',
-      `count="${navBefore.countText}" marks=${JSON.stringify(navBefore.marks)}`
+      `count="${navBefore.countText}" activeRows=${navBefore.activeHunkRows} ` +
+        `marks=${JSON.stringify(navBefore.marks)}`
     );
     await shot(page, '5b2-diff-nav-shown');
     // hunk が 1 件だけのノードだと「次へ」で移動先が現在地と一致し得るため、
@@ -686,15 +689,44 @@ try {
           `count ${navBefore.countText} -> ${navAfterNext.countText}`
     );
     await shot(page, '5b3-diff-nav-next');
+    // 末尾付近の hunk はスクロール位置が上限でクランプされ、位置ベースの現在地判定だと
+    // そこから先へ進めなくなる（PR #29 で見つかった不具合）。残り回数ぶん「次へ」を押し、
+    // カウンタが 2,3,…,N と進んで 1 に折り返す＝全 hunk を巡回できることを確認する
+    if (totalHunks >= 2) {
+      const counts = [navAfterNext.countText];
+      for (let i = 2; i <= totalHunks; i++) {
+        await page.locator('#functions-tree-panel-host .diff-nav-next').click();
+        await page.waitForTimeout(300);
+        counts.push((await readDiffNav()).countText);
+      }
+      const expected = [
+        ...Array.from({ length: totalHunks - 1 }, (_, i) => `${i + 2} / ${totalHunks}`),
+        `1 / ${totalHunks}`,
+      ];
+      record(
+        'diff nav: "next" cycles through every hunk including clamped ones at the end',
+        counts.join(',') === expected.join(','),
+        `counts=[${counts.join(' -> ')}] expected=[${expected.join(' -> ')}]`
+      );
+      await shot(page, '5b3b-diff-nav-cycled');
+    } else {
+      record(
+        'diff nav: "next" cycles through every hunk including clamped ones at the end',
+        true,
+        `hunk 数が 1 件のため巡回確認をスキップ（count=${navBefore.countText}）`
+      );
+    }
+    const navBeforePrev = await readDiffNav();
     await page.locator('#functions-tree-panel-host .diff-nav-prev').click();
     await page.waitForTimeout(500);
     const navAfterPrev = await readDiffNav();
     record(
       'diff nav: "prev" button scrolls back toward the previous hunk',
-      totalHunks < 2 || navAfterPrev.scrollTop !== navAfterNext.scrollTop,
+      totalHunks < 2 || navAfterPrev.countText !== navBeforePrev.countText,
       totalHunks < 2
         ? 'hunk 数が 1 件のため移動確認をスキップ'
-        : `scrollTop ${navAfterNext.scrollTop} -> ${navAfterPrev.scrollTop}`
+        : `count ${navBeforePrev.countText} -> ${navAfterPrev.countText} ` +
+          `scrollTop ${navBeforePrev.scrollTop} -> ${navAfterPrev.scrollTop}`
     );
   } else {
     record(
