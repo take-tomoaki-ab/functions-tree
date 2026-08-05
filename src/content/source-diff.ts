@@ -110,3 +110,59 @@ export function diffStat(rows: SourceRow[]): DiffStat {
   }
   return { added, deleted };
 }
+
+/**
+ * 差分ナビゲーション（issue #25）用の hunk 単位。
+ * 「次の差分へ」「前の差分へ」がジャンプする 1 塊で、context を挟まず連続する
+ * add/del 行（削除→追加の並びも含む）をひとまとまりとして扱う。
+ * startRow/endRow は rows のインデックス（endRow は排他的）。
+ */
+export interface DiffHunk {
+  startRow: number;
+  endRow: number;
+}
+
+/** rows を先頭から走査し、context 以外が連続する区間ごとに hunk を切り出す */
+export function computeDiffHunks(rows: SourceRow[]): DiffHunk[] {
+  const hunks: DiffHunk[] = [];
+  let i = 0;
+  while (i < rows.length) {
+    if (rows[i].kind === 'context') {
+      i++;
+      continue;
+    }
+    const startRow = i;
+    while (i < rows.length && rows[i].kind !== 'context') i++;
+    hunks.push({ startRow, endRow: i });
+  }
+  return hunks;
+}
+
+/**
+ * overview ruler（VSCode のスクロールバー横の差分インジケータ）用のマーク。
+ * ratio は rows 全体を 0〜1 とした比率で、hunk とは異なり add/del を分けたまま
+ * 連続区間ごとに区切る（削除の直後の追加は別マークとして両方見えるように）。
+ */
+export interface DiffMark {
+  kind: 'add' | 'del';
+  startRatio: number;
+  endRatio: number;
+}
+
+export function computeDiffMarks(rows: SourceRow[]): DiffMark[] {
+  const total = rows.length;
+  if (total === 0) return [];
+  const marks: DiffMark[] = [];
+  let i = 0;
+  while (i < rows.length) {
+    const kind = rows[i].kind;
+    if (kind === 'context') {
+      i++;
+      continue;
+    }
+    const start = i;
+    while (i < rows.length && rows[i].kind === kind) i++;
+    marks.push({ kind, startRatio: start / total, endRatio: i / total });
+  }
+  return marks;
+}

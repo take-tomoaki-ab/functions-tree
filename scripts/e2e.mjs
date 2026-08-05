@@ -70,6 +70,12 @@
 // - コード表示の識別子（`.ident`）をクリックすると選択され、同名の識別子すべてが
 //   ハイライト（`.ident-selected`）される。もう一度クリックすると解除される
 //
+// feat/issue-25-diff-navigation で追加した確認項目:
+// - 差分を含む関数には「次の差分へ」「前の差分へ」ボタン + カウンタ（.diff-nav）が出て、
+//   クリックで該当 hunk までソースがスクロールする
+// - ソース表示の横に overview ruler（.diff-ruler）が出て、追加/削除行の位置が
+//   マーク（.diff-ruler-mark）で示される
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -630,6 +636,101 @@ try {
   } else {
     record(
       'node detail: added lines highlighted with + marker and green background',
+      false,
+      `追加行を持つコメント可能ノードが見つからない（commentable=${commentableTotal}）`
+    );
+  }
+
+  // === feat/issue-25-diff-navigation ===
+  // 6.3b2. 差分ナビゲーション: 「次の差分へ」「前の差分へ」ボタン + カウンタ + overview
+  //        ruler（issue #25）。直前のループで選択済みの withAdd ノード（追加行あり）で確認する。
+  const readDiffNav = () =>
+    page.evaluate(() => {
+      const shadow = document.querySelector('#functions-tree-panel-host')?.shadowRoot;
+      const source = shadow?.querySelector('.source');
+      return {
+        hasNav: !!shadow?.querySelector('.diff-nav'),
+        countText: (shadow?.querySelector('.diff-nav-count')?.textContent ?? '').trim(),
+        scrollTop: source?.scrollTop ?? -1,
+        activeHunkRows: shadow?.querySelectorAll('.src-line.hunk-active').length ?? 0,
+        marks: [...(shadow?.querySelectorAll('.diff-ruler-mark') ?? [])].map((el) => ({
+          kind: el.classList.contains('mark-add') ? 'add' : 'del',
+          color: getComputedStyle(el).backgroundColor,
+        })),
+      };
+    });
+  if (withAdd) {
+    const navBefore = await readDiffNav();
+    const countMatch = /^(\d+) \/ (\d+)$/.exec(navBefore.countText);
+    const addMark = navBefore.marks.find((m) => m.kind === 'add');
+    record(
+      'diff nav: prev/next buttons + counter + overview ruler shown for a changed function',
+      navBefore.hasNav && countMatch !== null && Number(countMatch[1]) === 1 &&
+        navBefore.activeHunkRows > 0 &&
+        !!addMark && addMark.color !== 'rgba(0, 0, 0, 0)',
+      `count="${navBefore.countText}" activeRows=${navBefore.activeHunkRows} ` +
+        `marks=${JSON.stringify(navBefore.marks)}`
+    );
+    await shot(page, '5b2-diff-nav-shown');
+    // hunk が 1 件だけのノードだと「次へ」で移動先が現在地と一致し得るため、
+    // 複数 hunk があるときだけ実際の移動（scrollTop / カウンタ変化）を確認する
+    const totalHunks = countMatch ? Number(countMatch[2]) : 0;
+    await page.locator('#functions-tree-panel-host .diff-nav-next').click();
+    await page.waitForTimeout(500); // scrollTo behavior:'smooth' の完了待ち
+    const navAfterNext = await readDiffNav();
+    record(
+      'diff nav: "next" button scrolls to the next hunk and advances the counter',
+      totalHunks < 2 ||
+        (navAfterNext.scrollTop !== navBefore.scrollTop &&
+          navAfterNext.countText !== navBefore.countText),
+      totalHunks < 2
+        ? `hunk 数が 1 件のため移動確認をスキップ（count=${navBefore.countText}）`
+        : `scrollTop ${navBefore.scrollTop} -> ${navAfterNext.scrollTop} ` +
+          `count ${navBefore.countText} -> ${navAfterNext.countText}`
+    );
+    await shot(page, '5b3-diff-nav-next');
+    // 末尾付近の hunk はスクロール位置が上限でクランプされ、位置ベースの現在地判定だと
+    // そこから先へ進めなくなる（PR #29 で見つかった不具合）。残り回数ぶん「次へ」を押し、
+    // カウンタが 2,3,…,N と進んで 1 に折り返す＝全 hunk を巡回できることを確認する
+    if (totalHunks >= 2) {
+      const counts = [navAfterNext.countText];
+      for (let i = 2; i <= totalHunks; i++) {
+        await page.locator('#functions-tree-panel-host .diff-nav-next').click();
+        await page.waitForTimeout(300);
+        counts.push((await readDiffNav()).countText);
+      }
+      const expected = [
+        ...Array.from({ length: totalHunks - 1 }, (_, i) => `${i + 2} / ${totalHunks}`),
+        `1 / ${totalHunks}`,
+      ];
+      record(
+        'diff nav: "next" cycles through every hunk including clamped ones at the end',
+        counts.join(',') === expected.join(','),
+        `counts=[${counts.join(' -> ')}] expected=[${expected.join(' -> ')}]`
+      );
+      await shot(page, '5b3b-diff-nav-cycled');
+    } else {
+      record(
+        'diff nav: "next" cycles through every hunk including clamped ones at the end',
+        true,
+        `hunk 数が 1 件のため巡回確認をスキップ（count=${navBefore.countText}）`
+      );
+    }
+    const navBeforePrev = await readDiffNav();
+    await page.locator('#functions-tree-panel-host .diff-nav-prev').click();
+    await page.waitForTimeout(500);
+    const navAfterPrev = await readDiffNav();
+    record(
+      'diff nav: "prev" button scrolls back toward the previous hunk',
+      totalHunks < 2 || navAfterPrev.countText !== navBeforePrev.countText,
+      totalHunks < 2
+        ? 'hunk 数が 1 件のため移動確認をスキップ'
+        : `count ${navBeforePrev.countText} -> ${navAfterPrev.countText} ` +
+          `scrollTop ${navBeforePrev.scrollTop} -> ${navAfterPrev.scrollTop}`
+    );
+  } else {
+    record(
+      'diff nav: prev/next buttons + counter + overview ruler shown for a changed function',
       false,
       `追加行を持つコメント可能ノードが見つからない（commentable=${commentableTotal}）`
     );

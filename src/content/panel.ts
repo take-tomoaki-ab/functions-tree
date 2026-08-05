@@ -17,11 +17,12 @@ import { sendToBackground } from '../shared/messages';
 import { getSidePaneWidth, setSidePaneWidth } from '../shared/panel-prefs';
 import { draftNodeIds, findCommentForNode } from '../shared/review-drafts';
 import { getPat, PAT_KEY } from '../shared/settings';
+import { createDiffNav } from './diff-nav';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
 import type { GraphRenderer, RenderHandle } from './mermaid-view';
-import type { SourceRow } from './source-diff';
-import { buildSourceRows, diffStat } from './source-diff';
+import type { DiffHunk, SourceRow } from './source-diff';
+import { buildSourceRows, computeDiffHunks, computeDiffMarks, diffStat } from './source-diff';
 import { splitSourceSegments } from './source-segments';
 import {
   anchoredScroll,
@@ -368,14 +369,86 @@ const PANEL_CSS = `
 @media (prefers-color-scheme: dark) {
   .detail-meta { color: #9198a1; }
 }
-.source {
-  margin: 0 0 12px;
-  padding: 8px;
+/* ソース表示（.source）と overview ruler（.diff-ruler）を横並びにするラッパー。
+   max-height はこちらに付け、.source は flex で高さを合わせる
+   （.source に直接 %指定すると、ラッパーを挟んだことで基準が変わってしまうため） */
+.source-area {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
   max-height: 45%;
+  min-height: 0;
+  margin: 0 0 12px;
+}
+.source {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 8px;
   overflow: auto;
   background: rgba(140, 149, 159, 0.1);
   border: 1px solid rgba(140, 149, 159, 0.3);
   border-radius: 6px;
+}
+/* VSCode の overview ruler 風の差分位置インジケータ（issue #25）。
+   ratio（0〜1）を .source の高さに対する割合として top/height に反映する */
+.diff-ruler {
+  position: relative;
+  flex-shrink: 0;
+  width: 6px;
+  border-radius: 3px;
+  background: rgba(140, 149, 159, 0.15);
+}
+.diff-ruler-mark {
+  position: absolute;
+  left: 0;
+  right: 0;
+  min-height: 2px;
+  border-radius: 1px;
+}
+.diff-ruler-mark.mark-add { background: #1a7f37; }
+.diff-ruler-mark.mark-del { background: #cf222e; }
+@media (prefers-color-scheme: dark) {
+  .diff-ruler { background: rgba(110, 118, 129, 0.25); }
+  .diff-ruler-mark.mark-add { background: #3fb950; }
+  .diff-ruler-mark.mark-del { background: #f85149; }
+}
+/* 「次の差分へ」「前の差分へ」ボタン + 現在位置カウンタ（issue #25） */
+.diff-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 6px;
+  font-size: 11px;
+}
+.diff-nav-button {
+  min-width: 22px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 1;
+  color: #25292e;
+  background: #f6f8fa;
+  border: 1px solid #d1d9e0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.diff-nav-button:hover { background: #eef1f4; }
+.diff-nav-count {
+  min-width: 34px;
+  text-align: center;
+  color: #59636e;
+  font-variant-numeric: tabular-nums;
+}
+@media (prefers-color-scheme: dark) {
+  .diff-nav-button {
+    color: #f0f6fc;
+    background: rgba(110, 118, 129, 0.15);
+    border-color: #3d444d;
+  }
+  .diff-nav-button:hover { background: rgba(110, 118, 129, 0.3); }
+  .diff-nav-count { color: #9198a1; }
 }
 .source code {
   display: block;
@@ -419,6 +492,12 @@ const PANEL_CSS = `
   .src-line.src-del { background: rgba(248, 81, 73, 0.15); }
   .src-line.src-del .src-marker { color: #f85149; }
   .src-line.src-del .src-content { color: #ffa198; }
+}
+/* 差分ナビで選択中の hunk（issue #25）。末尾付近の hunk は選択してもスクロール位置が
+   上限でクランプされて画面が動かないので、左端のアクセントで現在位置を示す */
+.src-line.hunk-active { box-shadow: inset 2px 0 0 #0969da; }
+@media (prefers-color-scheme: dark) {
+  .src-line.hunk-active { box-shadow: inset 2px 0 0 #4493f8; }
 }
 /* 追加 / 削除の行数サマリ（詳細タイトル横） */
 .diff-stat {
@@ -1707,6 +1786,115 @@ function attachIdentifierSelection(code: HTMLElement): void {
   });
 }
 
+/** ソース表示の右に添える overview ruler（VSCode 風の差分位置インジケータ、issue #25） */
+function buildDiffRuler(rows: SourceRow[]): HTMLElement {
+  const ruler = document.createElement('div');
+  ruler.className = 'diff-ruler';
+  ruler.setAttribute('aria-hidden', 'true');
+  for (const mark of computeDiffMarks(rows)) {
+    const el = document.createElement('div');
+    el.className = `diff-ruler-mark mark-${mark.kind}`;
+    el.style.top = `${mark.startRatio * 100}%`;
+    el.style.height = `${(mark.endRatio - mark.startRatio) * 100}%`;
+    ruler.appendChild(el);
+  }
+  return ruler;
+}
+
+/**
+ * hunk（差分の塊）の開始行が、source のスクロール座標系で何 px の位置にあるか。
+ * offsetTop は Shadow DOM 内で offsetParent が不定になりやすいため使わず、
+ * getBoundingClientRect の差分 + 現在の scrollTop から求める
+ * （呼び出し時点のレイアウトを都度読むので、リサイズ後でも正しい）。
+ */
+function hunkScrollTop(source: HTMLElement, code: HTMLElement, hunk: DiffHunk): number {
+  const el = code.children[hunk.startRow];
+  if (!(el instanceof HTMLElement)) return 0;
+  return el.getBoundingClientRect().top - source.getBoundingClientRect().top + source.scrollTop;
+}
+
+/**
+ * 「次の差分へ」「前の差分へ」ボタンと現在位置カウンタ（issue #25）。
+ * hunk 単位（context を挟まない add/del の連続区間）でジャンプする。
+ * 選択中の hunk は createDiffNav が状態として持ち（スクロール位置から逆算すると
+ * 末尾付近のクランプ域で先へ進めなくなる）、手動スクロールには syncToScroll で追従する。
+ * 両端は折り返す（最後の次へ → 最初に戻る）。
+ */
+interface DiffNavUi {
+  el: HTMLElement;
+  /**
+   * カウンタと選択中 hunk のハイライトを描く。build 時点では code がまだ
+   * sidePaneEl に入っていないので、初期表示はこの呼び出しで行う（呼び出し側の責務）。
+   */
+  refresh: () => void;
+}
+
+function buildDiffNav(source: HTMLElement, code: HTMLElement, hunks: DiffHunk[]): DiffNavUi {
+  const nav = document.createElement('div');
+  nav.className = 'diff-nav';
+
+  const prev = document.createElement('button');
+  prev.className = 'diff-nav-button diff-nav-prev';
+  prev.type = 'button';
+  prev.textContent = '▲';
+  prev.title = '前の差分へ';
+  prev.setAttribute('aria-label', '前の差分へ');
+
+  const count = document.createElement('span');
+  count.className = 'diff-nav-count';
+
+  const next = document.createElement('button');
+  next.className = 'diff-nav-button diff-nav-next';
+  next.type = 'button';
+  next.textContent = '▼';
+  next.title = '次の差分へ';
+  next.setAttribute('aria-label', '次の差分へ');
+
+  const state = createDiffNav(hunks.length, {
+    scrollTop: () => source.scrollTop,
+    maxScrollTop: () => source.scrollHeight - source.clientHeight,
+    hunkTop: (index) => hunkScrollTop(source, code, hunks[index]),
+  });
+
+  /**
+   * 選択中の hunk の行に目印を付ける。
+   * 末尾付近の hunk はスクロール位置が上限でクランプされて画面が動かないので、
+   * ここが「次へ / 前へ が効いた」ことを示す唯一の手掛かりになる。
+   */
+  const highlightActiveHunk = (): void => {
+    for (const el of code.querySelectorAll('.hunk-active')) {
+      el.classList.remove('hunk-active');
+    }
+    const hunk = hunks[state.index()];
+    for (let row = hunk.startRow; row < hunk.endRow; row++) {
+      code.children[row]?.classList.add('hunk-active');
+    }
+  };
+  const refresh = (): void => {
+    count.textContent = state.label();
+    highlightActiveHunk();
+  };
+  // 移動先がクランプされて scroll イベントが起きないこともあるので、
+  // 表示の更新はスクロール完了待ちではなくクリック時点で行う
+  const goTo = (top: number): void => {
+    source.scrollTo({ top, behavior: 'smooth' });
+    refresh();
+  };
+  prev.addEventListener('click', () => goTo(state.prev()));
+  next.addEventListener('click', () => goTo(state.next()));
+  source.addEventListener(
+    'scroll',
+    () => {
+      state.syncToScroll();
+      refresh();
+    },
+    { passive: true }
+  );
+
+  nav.append(prev, count, next);
+  return { el: nav, refresh };
+}
+
 /** サイドペインに関数詳細（名前 / 位置 / ソース / コメント欄）を描画する */
 function renderNodeDetail(node: GraphNode): void {
   if (!sidePaneEl) return;
@@ -1745,6 +1933,14 @@ function renderNodeDetail(node: GraphNode): void {
   applyIdentifierSelection(code);
   source.appendChild(code);
 
+  // 差分ナビゲーション（issue #25）: 差分（add/del）がある関数だけボタンとルーラーを出す
+  const hunks = computeDiffHunks(rows);
+  const diffNav = hunks.length > 0 ? buildDiffNav(source, code, hunks) : null;
+  const sourceArea = document.createElement('div');
+  sourceArea.className = 'source-area';
+  sourceArea.appendChild(source);
+  if (hunks.length > 0) sourceArea.appendChild(buildDiffRuler(rows));
+
   const commentArea = document.createElement('div');
   commentArea.className = 'comment-area';
   const commentLabel = document.createElement('span');
@@ -1763,7 +1959,13 @@ function renderNodeDetail(node: GraphNode): void {
     commentArea.appendChild(disabled);
   }
 
-  sidePaneEl.replaceChildren(titleRow, location, meta, source, commentArea);
+  sidePaneEl.replaceChildren(
+    ...[titleRow, location, meta, diffNav?.el ?? null, sourceArea, commentArea].filter(
+      (el): el is HTMLElement => el !== null
+    )
+  );
+  // getBoundingClientRect に依存するカウンタ算出は DOM 接続後でないと正しく動かない
+  diffNav?.refresh();
 }
 
 /**
