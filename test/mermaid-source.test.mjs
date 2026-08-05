@@ -7,6 +7,7 @@ import { describe, test } from 'node:test';
 
 import {
   buildMermaidSource,
+  disambiguateFileLabels,
   filterGraph,
   NODE_CLASS_COMMENTABLE,
   NODE_CLASS_DEPENDENCY,
@@ -150,5 +151,94 @@ describe('filterGraph', () => {
     const filtered = filterGraph(onlyIsolated, { connectedOnly: true, inDiffOnly: false });
     assert.equal(filtered.nodes.length, 0);
     assert.equal(filtered.edges.length, 0);
+  });
+});
+
+describe('disambiguateFileLabels', () => {
+  test('同名ファイルがなければファイル名のみを返す', () => {
+    const labels = disambiguateFileLabels(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+    assert.deepEqual(labels, ['a.ts', 'b.ts', 'c.ts']);
+  });
+
+  test('同一ファイル内の複数関数（filePath が完全一致）はファイル名のみを返す', () => {
+    const labels = disambiguateFileLabels(['src/a.ts', 'src/a.ts', 'src/b.ts']);
+    assert.deepEqual(labels, ['a.ts', 'a.ts', 'b.ts']);
+  });
+
+  test('同名ファイル2件は、差が出る直近のディレクトリまで遡って表示する（issue #26 の例）', () => {
+    const labels = disambiguateFileLabels(['a/components/index.tsx', 'b/components/index.tsx']);
+    assert.deepEqual(labels, ['a/components/index.tsx', 'b/components/index.tsx']);
+  });
+
+  test('中間ディレクトリが同名でも、直近1階層で区別がつけばそこで止める', () => {
+    const labels = disambiguateFileLabels(['src/foo/bar.ts', 'src/baz/bar.ts', 'test/bar.ts']);
+    assert.deepEqual(labels, ['foo/bar.ts', 'baz/bar.ts', 'test/bar.ts']);
+  });
+
+  test('3件以上の同名ファイルは、衝突しているものだけ追加でディレクトリを遡る', () => {
+    const labels = disambiguateFileLabels([
+      'a/x/index.tsx',
+      'b/x/index.tsx',
+      'c/y/index.tsx',
+    ]);
+    assert.deepEqual(labels, ['a/x/index.tsx', 'b/x/index.tsx', 'y/index.tsx']);
+  });
+
+  test('深さの異なる同名ファイルは、浅い側は自身の全ディレクトリで打ち止めになる', () => {
+    const labels = disambiguateFileLabels(['a/index.tsx', 'a/b/index.tsx']);
+    assert.deepEqual(labels, ['a/index.tsx', 'b/index.tsx']);
+  });
+
+  test('深さの異なる同名ファイルで浅い側がルート直下（ディレクトリなし）の場合', () => {
+    const labels = disambiguateFileLabels(['index.tsx', 'src/index.tsx']);
+    assert.deepEqual(labels, ['index.tsx', 'src/index.tsx']);
+  });
+
+  test('components/index.tsx パターン: 同名複数でも別グループの同名は独立して解決する', () => {
+    const labels = disambiguateFileLabels([
+      'a/components/index.tsx',
+      'b/components/index.tsx',
+      'x/utils/helper.ts',
+      'y/utils/helper.ts',
+    ]);
+    assert.deepEqual(labels, [
+      'a/components/index.tsx',
+      'b/components/index.tsx',
+      'x/utils/helper.ts',
+      'y/utils/helper.ts',
+    ]);
+  });
+
+  test('入力順やインデックスに依存せず、各要素に対応するラベルを返す', () => {
+    const labels = disambiguateFileLabels([
+      'src/b.ts',
+      'a/components/index.tsx',
+      'b/components/index.tsx',
+      'src/a.ts',
+    ]);
+    assert.deepEqual(labels, [
+      'b.ts',
+      'a/components/index.tsx',
+      'b/components/index.tsx',
+      'a.ts',
+    ]);
+  });
+});
+
+describe('buildMermaidSource: 同名ファイルの区別表示（issue #26）', () => {
+  test('同名ファイルが複数あるノードは、区別がつくディレクトリ接頭辞付きでラベル表示される', () => {
+    const dup1 = node('render', 'a/components/index.tsx', 1, false);
+    const dup2 = node('render', 'b/components/index.tsx', 1, false);
+    const unique = node('helper', 'src/util.ts', 5, false);
+    const { source } = buildMermaidSource({
+      nodes: [dup1, dup2, unique],
+      edges: [],
+      analyzedFiles: [],
+      skippedFiles: [],
+      unresolvedCallCount: 0,
+    });
+    assert.match(source, /^ {2}n0\["render<br\/>a\/components\/index\.tsx:1"\]/m);
+    assert.match(source, /^ {2}n1\["render<br\/>b\/components\/index\.tsx:1"\]/m);
+    assert.match(source, /^ {2}n2\["helper<br\/>util\.ts:5"\]/m);
   });
 });

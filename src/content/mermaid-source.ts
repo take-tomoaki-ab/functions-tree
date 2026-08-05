@@ -71,9 +71,78 @@ function escapeLabel(text: string): string {
     .replace(/>/g, '#gt;');
 }
 
-function shortFileName(filePath: string): string {
-  const base = filePath.split('/').pop();
-  return base && base.length > 0 ? base : filePath;
+/**
+ * 同名ファイル（ベース名が一致する異なるパス）を区別できる最短のディレクトリ接頭辞付きラベルを返す。
+ * VSCode のタブ表示と同様、ファイルに近い側のディレクトリから 1 階層ずつ遡り、
+ * 他の同名ファイルと区別がつき次第そこで止める（区別に必要な階層数はパスごとに異なりうる）。
+ * ベース名が他と重複しないパス、または（同一ファイル内の複数関数のように）
+ * 完全に同一のパスしか同じベース名を持たない場合はベース名のみを返す。
+ */
+export function disambiguateFileLabels(filePaths: string[]): string[] {
+  const segmentsOf = (path: string): string[] => path.split('/');
+
+  const indicesByBase = new Map<string, number[]>();
+  filePaths.forEach((path, index) => {
+    const segments = segmentsOf(path);
+    const base = segments[segments.length - 1] ?? path;
+    const indices = indicesByBase.get(base);
+    if (indices) indices.push(index);
+    else indicesByBase.set(base, [index]);
+  });
+
+  const labels = new Array<string>(filePaths.length);
+
+  for (const [base, indices] of indicesByBase) {
+    const uniquePaths = [...new Set(indices.map((i) => filePaths[i]))];
+    if (uniquePaths.length <= 1) {
+      for (const i of indices) labels[i] = base;
+      continue;
+    }
+
+    const dirsOf = new Map(
+      uniquePaths.map((path) => {
+        const segments = segmentsOf(path);
+        return [path, segments.slice(0, segments.length - 1)] as const;
+      })
+    );
+    const depthOf = new Map(uniquePaths.map((path) => [path, 0]));
+    const labelForDepth = (path: string): string => {
+      const dirs = dirsOf.get(path) ?? [];
+      const depth = Math.min(depthOf.get(path) ?? 0, dirs.length);
+      const suffix = depth > 0 ? dirs.slice(dirs.length - depth) : [];
+      return suffix.length > 0 ? `${suffix.join('/')}/${base}` : base;
+    };
+
+    // 区別がつくまで、衝突しているパスだけディレクトリを 1 階層ずつ追加する
+    const maxDirs = Math.max(...uniquePaths.map((p) => dirsOf.get(p)?.length ?? 0));
+    for (let round = 0; round <= maxDirs; round++) {
+      const byLabel = new Map<string, string[]>();
+      for (const path of uniquePaths) {
+        const label = labelForDepth(path);
+        const group = byLabel.get(label);
+        if (group) group.push(path);
+        else byLabel.set(label, [path]);
+      }
+      let anyExtended = false;
+      for (const group of byLabel.values()) {
+        if (group.length <= 1) continue;
+        for (const path of group) {
+          const dirs = dirsOf.get(path) ?? [];
+          const depth = depthOf.get(path) ?? 0;
+          if (depth < dirs.length) {
+            depthOf.set(path, depth + 1);
+            anyExtended = true;
+          }
+        }
+      }
+      if (!anyExtended) break;
+    }
+
+    const labelOf = new Map(uniquePaths.map((path) => [path, labelForDepth(path)]));
+    for (const i of indices) labels[i] = labelOf.get(filePaths[i]) ?? base;
+  }
+
+  return labels;
 }
 
 /**
@@ -85,6 +154,7 @@ export function buildMermaidSource(graph: FunctionGraph): MermaidGraphSource {
   const lines: string[] = ['flowchart LR'];
   const mermaidIdOf = new Map<string, string>();
   const nodeByMermaidId = new Map<string, GraphNode>();
+  const fileLabels = disambiguateFileLabels(graph.nodes.map((n) => n.filePath));
 
   graph.nodes.forEach((node, index) => {
     const mermaidId = `n${index}`;
@@ -92,7 +162,7 @@ export function buildMermaidSource(graph: FunctionGraph): MermaidGraphSource {
     nodeByMermaidId.set(mermaidId, node);
     const label =
       `${escapeLabel(node.name)}<br/>` +
-      `${escapeLabel(shortFileName(node.filePath))}:${node.startLine}`;
+      `${escapeLabel(fileLabels[index])}:${node.startLine}`;
     lines.push(`  ${mermaidId}["${label}"]:::${nodeClassOf(node)}`);
   });
 
