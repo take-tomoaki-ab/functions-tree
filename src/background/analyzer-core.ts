@@ -67,6 +67,13 @@ export const DEFAULT_MAX_DEPENDENCY_FILES = 20;
  */
 export const DEFAULT_MAX_DEPENDENCY_FETCHES = 60;
 
+/**
+ * 深さ 1 段の中で barrel（`export … from` だけの index.ts）を素通しで辿れる回数（issue #28 D）。
+ * `components/index.ts` → `components/card/index.ts` → `card.tsx` のような多段 barrel を
+ * 想定した上限。循環 re-export で無限ループしないための歯止めでもある。
+ */
+const MAX_TRANSPARENT_HOPS = 3;
+
 export function isAnalyzablePath(path: string): boolean {
   return languageForPath(path) !== undefined;
 }
@@ -347,75 +354,89 @@ export async function buildGraph(
       }
     };
 
-    for (const analysis of frontier) {
-      const def = languageForPath(analysis.path);
-      if (!def) continue;
-      for (const target of def.dependencyTargets(analysis, langState.get(def.id))) {
-        if (target.kind === 'file') {
-          // 候補パスを順に試し、最初に取得できたものを解析する
-          if (target.candidates.some((c) => analyzed.has(c))) continue;
-          if (dependencyFiles >= maxDependencyFiles) {
-            skipped.push({ path: target.candidates[0], reason: 'dependency_limit' });
-            continue;
-          }
-          const candidates = options.listDir
-            ? await narrowCandidates(target.candidates)
-            : target.candidates;
-          for (const candidate of candidates) {
-            if (dependencyFetches >= maxDependencyFetches) {
-              noteFetchLimit(candidate);
-              break;
+    /** 与えられたファイル群の依存を 1 段だけ取得・解析する */
+    const expand = async (files: FileAnalysis[]): Promise<void> => {
+      for (const analysis of files) {
+        const def = languageForPath(analysis.path);
+        if (!def) continue;
+        for (const target of def.dependencyTargets(analysis, langState.get(def.id))) {
+          if (target.kind === 'file') {
+            // 候補パスを順に試し、最初に取得できたものを解析する
+            if (target.candidates.some((c) => analyzed.has(c))) continue;
+            if (dependencyFiles >= maxDependencyFiles) {
+              skipped.push({ path: target.candidates[0], reason: 'dependency_limit' });
+              continue;
             }
-            dependencyFetches++;
-            const r = await fetchFile(candidate);
-            if (!r.ok) {
-              // 候補の探索なので not_found は静かに次の候補へ。それ以外は記録
-              if (r.reason !== 'not_found') {
-                skipped.push({ path: candidate, reason: r.reason });
+            const candidates = options.listDir
+              ? await narrowCandidates(target.candidates)
+              : target.candidates;
+            for (const candidate of candidates) {
+              if (dependencyFetches >= maxDependencyFetches) {
+                noteFetchLimit(candidate);
                 break;
               }
-              continue;
-            }
-            try {
-              const a = analyzer.analyzeFile(candidate, r.content);
-              analyzed.set(candidate, a);
-              added.push(a);
-              dependencyFiles++;
-            } catch (e) {
-              skipped.push({
-                path: candidate,
-                reason: `parse_error: ${e instanceof Error ? e.message : String(e)}`,
-              });
-            }
-            break;
-          }
-        } else {
-          // ディレクトリ内の対象ファイルすべて（Go のパッケージ）
-          if (!options.listDir && !requestedDirs.has(target.dir)) {
-            requestedDirs.add(target.dir);
-            skipped.push({ path: target.dir, reason: 'dir_listing_unavailable' });
-            continue;
-          }
-          const paths = await listDirFiles(target.dir);
-          if (paths === null) continue;
-          for (const p of paths) {
-            if (analyzed.has(p)) continue;
-            const pDef = languageForPath(p);
-            if (!pDef || pDef.id !== def.id) continue;
-            if (def.includeDirFile && !def.includeDirFile(p)) continue;
-            if (dependencyFiles >= maxDependencyFiles) {
-              skipped.push({ path: p, reason: 'dependency_limit' });
-              continue;
-            }
-            if (dependencyFetches >= maxDependencyFetches) {
-              noteFetchLimit(p);
+              dependencyFetches++;
+              const r = await fetchFile(candidate);
+              if (!r.ok) {
+                // 候補の探索なので not_found は静かに次の候補へ。それ以外は記録
+                if (r.reason !== 'not_found') {
+                  skipped.push({ path: candidate, reason: r.reason });
+                  break;
+                }
+                continue;
+              }
+              try {
+                const a = analyzer.analyzeFile(candidate, r.content);
+                analyzed.set(candidate, a);
+                added.push(a);
+                dependencyFiles++;
+              } catch (e) {
+                skipped.push({
+                  path: candidate,
+                  reason: `parse_error: ${e instanceof Error ? e.message : String(e)}`,
+                });
+              }
               break;
             }
-            dependencyFetches++;
-            await analyzeDependency(p);
+          } else {
+            // ディレクトリ内の対象ファイルすべて（Go のパッケージ）
+            if (!options.listDir && !requestedDirs.has(target.dir)) {
+              requestedDirs.add(target.dir);
+              skipped.push({ path: target.dir, reason: 'dir_listing_unavailable' });
+              continue;
+            }
+            const paths = await listDirFiles(target.dir);
+            if (paths === null) continue;
+            for (const p of paths) {
+              if (analyzed.has(p)) continue;
+              const pDef = languageForPath(p);
+              if (!pDef || pDef.id !== def.id) continue;
+              if (def.includeDirFile && !def.includeDirFile(p)) continue;
+              if (dependencyFiles >= maxDependencyFiles) {
+                skipped.push({ path: p, reason: 'dependency_limit' });
+                continue;
+              }
+              if (dependencyFetches >= maxDependencyFetches) {
+                noteFetchLimit(p);
+                break;
+              }
+              dependencyFetches++;
+              await analyzeDependency(p);
+            }
           }
         }
       }
+    };
+
+    // barrel は深さに数えない（issue #28 D）。同じ深さのまま、素通しファイルの依存を続けて辿る
+    let pending = frontier;
+    for (let hop = 0; pending.length > 0 && hop <= MAX_TRANSPARENT_HOPS; hop++) {
+      const before = added.length;
+      await expand(pending);
+      pending = added.slice(before).filter((a) => {
+        const def = languageForPath(a.path);
+        return def?.isTransparent?.(a) ?? false;
+      });
     }
     frontier = added;
   }

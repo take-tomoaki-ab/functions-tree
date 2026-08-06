@@ -60,6 +60,22 @@ export interface ImportBinding {
   typeOnly?: boolean;
 }
 
+/**
+ * 別ファイルへの再輸出 1 つ（issue #28 D）。
+ * `export { Card } from './card'` / `export * from './card'` のように、
+ * 自ファイルには実体がなく他ファイルの公開名を転送するだけの export。
+ */
+export interface ReExport {
+  /** このファイルでの公開名。`export * from './y'` は '*'（全名前の転送） */
+  exported: string;
+  /** 転送元ファイルでの名前。`export * from './y'` は '*' */
+  imported: string;
+  /** 転送元の指定文字列（'./card' など） */
+  source: string;
+  /** `export type { X } from` なら true。依存取得・解決の対象外 */
+  typeOnly?: boolean;
+}
+
 export interface FileAnalysis {
   path: string;
   /** 言語 id（LanguageDefinition.id） */
@@ -68,6 +84,8 @@ export interface FileAnalysis {
   packageName?: string;
   functions: FunctionInfo[];
   imports: ImportBinding[];
+  /** barrel（`export … from`）による他ファイルへの転送。対応しない言語は undefined */
+  reExports?: ReExport[];
 }
 
 export interface LanguageQueries {
@@ -131,6 +149,12 @@ export interface LanguageDefinition extends LanguageMetadata {
   dependencyTargets(analysis: FileAnalysis, state: unknown): DependencyTarget[];
   /** dir 依存の展開に含めるファイルか（Go は _test.go を除外）。省略時はすべて含める */
   includeDirFile?(path: string): boolean;
+  /**
+   * 依存の深さカウントから除外する「素通し」ファイルか（issue #28 D）。
+   * barrel（`export … from` だけの index.ts）は実装を持たないので、
+   * これを 1 hop と数えると深さ 1 では本体まで届かない。
+   */
+  isTransparent?(analysis: FileAnalysis): boolean;
   /** 呼び出しの解決。できなければ null（unresolvedCallCount に計上される） */
   resolveCall(
     analysis: FileAnalysis,
