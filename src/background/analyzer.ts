@@ -6,6 +6,7 @@ import type { GithubResult } from '../shared/github';
 import type { GraphPayload } from '../shared/graph';
 import type { PrRef } from '../shared/messages';
 import type { Analyzer, FetchFileResult, ListDirResult } from './analyzer-core';
+import { hasTokenFor } from '../shared/settings';
 import { buildGraph, createAnalyzer, isAnalyzablePath } from './analyzer-core';
 import { getFileContent, getPrFiles, getPrInfo, listDirectory } from './github-api';
 import type { CacheEntry } from './graph-cache';
@@ -105,27 +106,68 @@ export async function buildGraphForPr(
     };
   }
 
-  // 深さ 1 の依存取得も含め、ファイルの中身はすべて head 側リポジトリ + head SHA から引く
+  // 深さ 1 の依存取得も含め、ファイルの中身はすべて head 側リポジトリ + head SHA から引く。
+  // fork PR では head 側が別 owner のリポジトリになる。fine-grained token は
+  // 明示的に選択したリポジトリしかアクセスできず、しかもスコープ外は 404 で返るため、
+  // 「PR は読めるのに中身が 1 つも取れない」状態が起こりうる。空グラフを黙って返すと
+  // 原因が分からないので、fork 由来の失敗は種別を分けて明示的に通知する。
+  // 実際にここに落ちるのは private な base + 別 owner の fork のケースだけで、
+  // public な fork は下の contentAuthOwner のフォールバックで読める。
+  const isFork = headRepo.owner.toLowerCase() !== pr.owner.toLowerCase();
+  const forkRepo = `${headRepo.owner}/${headRepo.repo}`;
+
+  // fork PR で head 側 owner のトークンが無いときは base 側 owner のトークンで引く。
+  // fine-grained token は選択したリポジトリに加えて全 public リポジトリの read を
+  // 常に含むため、public な fork はこれで読める。未認証（60 req/h）に落とすと
+  // fork PR の解析がレート制限で成立しなくなるので、ここは必ず認証を通す。
+  // private な fork は base 側トークンでも 404 になり、fork_unreadable として通知する。
+  const contentAuthOwner =
+    isFork && !(await hasTokenFor(headRepo.owner)) ? pr.owner : headRepo.owner;
+
   let rateLimitError: GithubResult<GraphPayload> | null = null;
+  let forkError: GithubResult<GraphPayload> | null = null;
+
+  /** 取得失敗を skippedFiles の reason 文字列に落とす。fork 由来は別種別にする */
+  const classify = (error: { kind: string }, authMode: GithubResult<never>['authMode']): string => {
+    if (isFork && (error.kind === 'not_found' || error.kind === 'forbidden')) {
+      forkError ??= {
+        ok: false,
+        authMode,
+        error: {
+          kind: 'fork_unreadable',
+          message: `fork 元リポジトリ ${forkRepo} のファイルを取得できません`,
+          forkRepo,
+          owner: headRepo.owner,
+        },
+      };
+      return 'fork_unreadable';
+    }
+    return error.kind;
+  };
+
   const fetchFile = async (path: string): Promise<FetchFileResult> => {
-    const r = await getFileContent(headRepo.owner, headRepo.repo, path, headSha);
+    const r = await getFileContent(headRepo.owner, headRepo.repo, path, headSha, contentAuthOwner);
     if (r.ok) return { ok: true, content: r.value.content };
     // レート制限は覚えておき、1 ファイルも解析できなかったときのエラー表示に使う
     if (r.error.kind === 'rate_limited') rateLimitError = r;
-    return { ok: false, reason: r.error.kind };
+    return { ok: false, reason: classify(r.error, r.authMode) };
   };
 
   // Go のパッケージ解決用（ディレクトリ = パッケージ）。contents API はディレクトリも引ける
   const listDir = async (dir: string): Promise<ListDirResult> => {
-    const r = await listDirectory(headRepo.owner, headRepo.repo, dir, headSha);
+    const r = await listDirectory(headRepo.owner, headRepo.repo, dir, headSha, contentAuthOwner);
     if (r.ok) return { ok: true, paths: r.value };
     if (r.error.kind === 'rate_limited') rateLimitError = r;
-    return { ok: false, reason: r.error.kind };
+    return { ok: false, reason: classify(r.error, r.authMode) };
   };
 
   const graph = await buildGraph(analyzer, changedFiles, fetchFile, { listDir });
   if (rateLimitError && graph.analyzedFiles.length === 0) {
     return rateLimitError;
+  }
+  // 1 ファイルも解析できず、原因が fork 側の読めなさなら空グラフではなくエラーを返す
+  if (forkError && graph.analyzedFiles.length === 0) {
+    return forkError;
   }
 
   const payload: GraphPayload = { graph, headSha, fromCache: false };

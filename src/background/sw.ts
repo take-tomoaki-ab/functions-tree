@@ -2,6 +2,7 @@
 // GitHub API 呼び出しは github-api.ts に委譲する。Phase 3 で tree-sitter 解析がここに載る。
 
 import type { PongResponse, RequestMessage } from '../shared/messages';
+import { migrateLegacyPat } from '../shared/settings';
 import { buildGraphForPr } from './analyzer';
 import {
   addPendingComment,
@@ -14,6 +15,13 @@ import {
   testAuth,
   updatePendingComment,
 } from './github-api';
+
+// 旧・単一 PAT（githubPat）が残っていれば legacyPat へ退避する。黙って消すと
+// 「動かなくなった」の切り分けが困難になるので、options のバナーから明示的に削除させる。
+// 冪等なので SW が起き直すたびに走ってよい。
+void migrateLegacyPat().catch((e: unknown) => {
+  console.warn('[functions-tree] legacy PAT migration failed', e);
+});
 
 // MV3 の注意: 非同期に応答する場合は listener から true を返して
 // sendResponse を後から呼ぶ。false を返すと応答チャネルが即座に閉じる。
@@ -74,11 +82,11 @@ chrome.runtime.onMessage.addListener(
         return true;
       }
       case 'SUBMIT_PENDING_REVIEW': {
-        void submitPendingReview(message.reviewId).then(sendResponse);
+        void submitPendingReview(message.pr, message.reviewId).then(sendResponse);
         return true;
       }
       case 'TEST_AUTH': {
-        void testAuth().then(sendResponse);
+        void testAuth(message.owner, message.repo).then(sendResponse);
         return true;
       }
       default:

@@ -1,5 +1,8 @@
-// GitHub REST API クライアント。PAT を扱うため service worker 内でのみ使う。
+// GitHub REST API クライアント。トークンを扱うため service worker 内でのみ使う。
 // すべての関数は throw せず GithubResult<T> で返す（UI 側は describeGithubError で表示）。
+//
+// fine-grained token は「1 トークン = 1 owner」なので、すべての呼び出しに
+// 「どのリポジトリ向けか」の文脈（owner）を通し、その owner のトークンで認証する。
 
 import type {
   AuthMode,
@@ -12,10 +15,16 @@ import type {
   PrFilesPayload,
   PrInfo,
   ReviewSubmitPayload,
+  TokenCheckResult,
 } from '../shared/github';
 import type { PrRef } from '../shared/messages';
 import { buildPendingReviewCreateBody, parsePendingComments } from '../shared/review-drafts';
-import { getPat } from '../shared/settings';
+import {
+  getTokenFor,
+  parseTokenExpiration,
+  recordVerifiedRepo,
+  updateTokenMeta,
+} from '../shared/settings';
 
 const API_BASE = 'https://api.github.com';
 
@@ -38,18 +47,42 @@ interface FetchErr {
   error: GithubApiError;
 }
 
+/**
+ * リクエストの認証文脈。owner はトークンを引くためのキーで、
+ * null なら未認証で投げる（公開リポジトリのみ・低レート制限）。
+ */
+interface AuthContext {
+  owner: string | null;
+  tokenRegistered: boolean;
+}
+
+/**
+ * 応答ヘッダの `GitHub-Authentication-Token-Expiration` を storage に書き戻す。
+ * 実測ではこのヘッダは成功・失敗を問わずすべての応答に載る（GraphQL の POST にも）ので、
+ * 通常の API 呼び出しのついでに期限を最新化できる。ポーリングは不要。
+ * ヘッダ形式は `2026-08-12 06:13:53 UTC` で ISO8601 ではないため正規化して保存する。
+ */
+function recordExpiration(owner: string, headers: Headers): void {
+  const expiresAt = parseTokenExpiration(headers.get('github-authentication-token-expiration'));
+  if (!expiresAt) return;
+  // 書き戻しの失敗で API 呼び出し自体を壊さない
+  void updateTokenMeta(owner, { expiresAt }).catch(() => undefined);
+}
+
 async function apiRequest(
   method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
+  owner: string | null,
   pathAndQuery: string,
   body?: unknown
 ): Promise<FetchOk | FetchErr> {
-  const pat = await getPat();
-  const authMode: AuthMode = pat ? 'pat' : 'anonymous';
+  const entry = owner ? await getTokenFor(owner) : null;
+  const authMode: AuthMode = entry ? 'pat' : 'anonymous';
+  const auth: AuthContext = { owner, tokenRegistered: entry !== null };
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
   };
-  if (pat) headers['Authorization'] = `Bearer ${pat}`;
+  if (entry) headers['Authorization'] = `Bearer ${entry.token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
 
   let res: Response;
@@ -63,20 +96,34 @@ async function apiRequest(
     return {
       ok: false,
       authMode,
-      error: { kind: 'network', message: e instanceof Error ? e.message : String(e) },
+      error: {
+        kind: 'network',
+        message: e instanceof Error ? e.message : String(e),
+        owner: owner ?? undefined,
+        tokenRegistered: auth.tokenRegistered,
+      },
     };
   }
+  if (owner && entry) recordExpiration(owner, res.headers);
   if (res.ok) return { ok: true, authMode, res };
-  return { ok: false, authMode, error: await toApiError(res) };
+  return { ok: false, authMode, error: await toApiError(res, auth) };
 }
 
-function apiGet(pathAndQuery: string): Promise<FetchOk | FetchErr> {
-  return apiRequest('GET', pathAndQuery);
+function apiGet(owner: string | null, pathAndQuery: string): Promise<FetchOk | FetchErr> {
+  return apiRequest('GET', owner, pathAndQuery);
 }
 
-async function toApiError(res: Response): Promise<GithubApiError> {
+async function toApiError(res: Response, auth: AuthContext): Promise<GithubApiError> {
   const status = res.status;
   let message = res.statusText;
+  // 実測では 403 に限らず 200 / 404 にも載るのでステータスを問わず拾う。
+  // ただし GraphQL の応答には載らないため、書き込み系では取れないことが多い
+  const requiredPermissions = res.headers.get('x-accepted-github-permissions') ?? undefined;
+  const common = {
+    owner: auth.owner ?? undefined,
+    tokenRegistered: auth.tokenRegistered,
+    requiredPermissions,
+  };
   try {
     const body: unknown = await res.json();
     if (body && typeof body === 'object' && 'message' in body) {
@@ -101,7 +148,7 @@ async function toApiError(res: Response): Promise<GithubApiError> {
   } catch {
     // body が JSON でなくても statusText で続行
   }
-  if (status === 401) return { kind: 'unauthorized', status, message };
+  if (status === 401) return { kind: 'unauthorized', status, message, ...common };
   if (status === 403 || status === 429) {
     const remaining = res.headers.get('x-ratelimit-remaining');
     if (remaining === '0' || /rate limit/i.test(message)) {
@@ -111,17 +158,18 @@ async function toApiError(res: Response): Promise<GithubApiError> {
         status,
         message,
         rateLimitReset: reset ? Number(reset) * 1000 : undefined,
+        ...common,
       };
     }
-    return { kind: 'forbidden', status, message };
+    return { kind: 'forbidden', status, message, ...common };
   }
-  if (status === 404) return { kind: 'not_found', status, message };
-  return { kind: 'unexpected', status, message };
+  if (status === 404) return { kind: 'not_found', status, message, ...common };
+  return { kind: 'unexpected', status, message, ...common };
 }
 
 /** GET /repos/{owner}/{repo}/pulls/{n} — head SHA などのメタ情報 */
 export async function getPrInfo(pr: PrRef): Promise<GithubResult<PrInfo>> {
-  const r = await apiGet(`/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
+  const r = await apiGet(pr.owner, `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}`);
   if (!r.ok) return r;
   const json = (await r.res.json()) as {
     title: string;
@@ -153,6 +201,7 @@ export async function getPrFiles(pr: PrRef): Promise<GithubResult<PrFilesPayload
 
   for (let page = 1; page <= MAX_FILE_PAGES; page++) {
     const r = await apiGet(
+      pr.owner,
       `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/files?per_page=${FILES_PER_PAGE}&page=${page}`
     );
     if (!r.ok) return r;
@@ -191,15 +240,24 @@ function decodeBase64Utf8(b64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
-/** GET /repos/{owner}/{repo}/contents/{path}?ref={sha} — ファイル内容 */
+/**
+ * GET /repos/{owner}/{repo}/contents/{path}?ref={sha} — ファイル内容。
+ *
+ * authOwner に別の owner を渡すと、その owner のトークンで認証する。fork PR で
+ * head 側 owner のトークンが無いときに base 側のトークンを使うためのもので、
+ * fine-grained token が「選択したリポジトリ + 全 public リポジトリの read」を
+ * 常に含むことを利用している（未認証 60 req/h に落とさずに public fork を読める）。
+ */
 export async function getFileContent(
   owner: string,
   repo: string,
   path: string,
-  ref: string
+  ref: string,
+  authOwner: string = owner
 ): Promise<GithubResult<FileContentPayload>> {
   const encodedPath = path.split('/').map(encodeURIComponent).join('/');
   const r = await apiGet(
+    authOwner,
     `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`
   );
   if (!r.ok) return r;
@@ -237,7 +295,8 @@ export async function listDirectory(
   owner: string,
   repo: string,
   dir: string,
-  ref: string
+  ref: string,
+  authOwner: string = owner
 ): Promise<GithubResult<string[]>> {
   const encodedPath = dir
     .split('/')
@@ -245,6 +304,7 @@ export async function listDirectory(
     .map(encodeURIComponent)
     .join('/');
   const r = await apiGet(
+    authOwner,
     `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`
   );
   if (!r.ok) return r;
@@ -268,12 +328,12 @@ export async function listDirectory(
   return { ok: true, authMode: r.authMode, value: paths };
 }
 
-/** PAT 必須の操作で PAT が無いときに返す共通エラー */
-function patRequired(message: string): FetchErr {
+/** トークン必須の操作で、その owner のトークンが無いときに返す共通エラー */
+function tokenRequired(owner: string, message: string): FetchErr {
   return {
     ok: false,
     authMode: 'anonymous',
-    error: { kind: 'pat_required', message },
+    error: { kind: 'token_required', message, owner, tokenRegistered: false },
   };
 }
 
@@ -283,31 +343,42 @@ function patRequired(message: string): FetchErr {
  * GraphQL はエラーでも HTTP 200 で errors 配列を返すため、ここで GithubApiError に写す。
  */
 async function graphqlRequest<T>(
+  owner: string,
   query: string,
   variables: Record<string, unknown>
 ): Promise<{ ok: true; authMode: AuthMode; data: T } | FetchErr> {
-  const r = await apiRequest('POST', '/graphql', { query, variables });
+  const r = await apiRequest('POST', owner, '/graphql', { query, variables });
   if (!r.ok) return r;
   const json = (await r.res.json()) as {
     data?: T;
-    errors?: Array<{ message?: unknown }>;
+    errors?: Array<{ message?: unknown; type?: unknown }>;
   };
   if (Array.isArray(json.errors) && json.errors.length > 0) {
     const message = json.errors
       .map((e) => String(e?.message ?? ''))
       .filter((s) => s.length > 0)
       .join(' / ');
+    // GraphQL はエラーでも HTTP 200 で返し、X-Accepted-GitHub-Permissions も載らない。
+    // NOT_FOUND / FORBIDDEN の type だけは拾って、権限まわりの案内に寄せる
+    const type = json.errors.map((e) => String(e?.type ?? '')).find((t) => t.length > 0);
+    const kind =
+      type === 'NOT_FOUND' ? 'not_found' : type === 'FORBIDDEN' ? 'forbidden' : 'unexpected';
     return {
       ok: false,
       authMode: r.authMode,
-      error: { kind: 'unexpected', message: message || 'GraphQL エラー' },
+      error: {
+        kind,
+        message: message || 'GraphQL エラー',
+        owner,
+        tokenRegistered: r.authMode === 'pat',
+      },
     };
   }
   if (json.data === undefined || json.data === null) {
     return {
       ok: false,
       authMode: r.authMode,
-      error: { kind: 'unexpected', message: 'GraphQL 応答に data がありません' },
+      error: { kind: 'unexpected', message: 'GraphQL 応答に data がありません', owner },
     };
   }
   return { ok: true, authMode: r.authMode, data: json.data };
@@ -336,6 +407,7 @@ async function fetchPendingReview(
   pr: PrRef
 ): Promise<{ ok: true; authMode: AuthMode; value: PendingReviewPayload } | FetchErr> {
   const r = await graphqlRequest<PendingReviewQueryData>(
+    pr.owner,
     `query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
@@ -353,7 +425,12 @@ async function fetchPendingReview(
     return {
       ok: false,
       authMode: r.authMode,
-      error: { kind: 'not_found', message: `PR が見つかりません: ${pr.owner}/${pr.repo}#${pr.pr}` },
+      error: {
+        kind: 'not_found',
+        message: `PR が見つかりません: ${pr.owner}/${pr.repo}#${pr.pr}`,
+        owner: pr.owner,
+        tokenRegistered: r.authMode === 'pat',
+      },
     };
   }
   const pending = pullRequest.reviews.nodes.find((n) => n !== null) ?? null;
@@ -371,15 +448,15 @@ async function fetchPendingReview(
 }
 
 /**
- * pending review の現在の状態を取得する。PAT 未設定時はエラーではなく
- * 「pending review なし」を返す（未認証では pending review は存在し得ないため、
- * パネルを開いただけでエラー表示にならないようにする）。
+ * pending review の現在の状態を取得する。その owner のトークンが未登録なら
+ * エラーではなく「pending review なし」を返す（未認証では pending review は
+ * 存在し得ないため、パネルを開いただけでエラー表示にならないようにする）。
  */
 export async function getPendingReview(
   pr: PrRef
 ): Promise<GithubResult<PendingReviewPayload>> {
-  const pat = await getPat();
-  if (!pat) {
+  const entry = await getTokenFor(pr.owner);
+  if (!entry) {
     return {
       ok: true,
       authMode: 'anonymous',
@@ -402,8 +479,8 @@ export async function addPendingComment(
   pr: PrRef,
   params: { commitId: string; path: string; line: number; body: string }
 ): Promise<GithubResult<PendingReviewPayload>> {
-  const pat = await getPat();
-  if (!pat) return patRequired('下書きの追加には PAT の設定が必要です');
+  const entry = await getTokenFor(pr.owner);
+  if (!entry) return tokenRequired(pr.owner, '下書きの追加にはトークンの登録が必要です');
 
   const state = await fetchPendingReview(pr);
   if (!state.ok) return state;
@@ -411,12 +488,14 @@ export async function addPendingComment(
   if (state.value.reviewId === null) {
     const r = await apiRequest(
       'POST',
+      pr.owner,
       `/repos/${pr.owner}/${pr.repo}/pulls/${pr.pr}/reviews`,
       buildPendingReviewCreateBody(params.commitId, params)
     );
     if (!r.ok) return r;
   } else {
     const r = await graphqlRequest(
+      pr.owner,
       `mutation($reviewId: ID!, $path: String!, $line: Int!, $body: String!) {
         addPullRequestReviewThread(input: {
           pullRequestReviewId: $reviewId, path: $path, line: $line, side: RIGHT, body: $body
@@ -443,9 +522,10 @@ export async function updatePendingComment(
   commentId: string,
   body: string
 ): Promise<GithubResult<PendingReviewPayload>> {
-  const pat = await getPat();
-  if (!pat) return patRequired('下書きの更新には PAT の設定が必要です');
+  const entry = await getTokenFor(pr.owner);
+  if (!entry) return tokenRequired(pr.owner, '下書きの更新にはトークンの登録が必要です');
   const r = await graphqlRequest(
+    pr.owner,
     `mutation($commentId: ID!, $body: String!) {
       updatePullRequestReviewComment(input: {
         pullRequestReviewCommentId: $commentId, body: $body
@@ -466,9 +546,10 @@ export async function deletePendingComment(
   pr: PrRef,
   commentId: string
 ): Promise<GithubResult<PendingReviewPayload>> {
-  const pat = await getPat();
-  if (!pat) return patRequired('下書きの削除には PAT の設定が必要です');
+  const entry = await getTokenFor(pr.owner);
+  if (!entry) return tokenRequired(pr.owner, '下書きの削除にはトークンの登録が必要です');
   const r = await graphqlRequest(
+    pr.owner,
     `mutation($commentId: ID!) {
       deletePullRequestReviewComment(input: { id: $commentId }) {
         pullRequestReview { id }
@@ -479,8 +560,12 @@ export async function deletePendingComment(
   if (!r.ok) return r;
   const after = await fetchPendingReview(pr);
   if (!after.ok) return after;
+  // 実測では最後のコメントを消すと pending review も GitHub 側で自動的に消えるが、
+  // 残るケースに備えて空レビューの明示削除は残す（deletePullRequestReview 自体は
+  // Pull requests: write だけで通ることを確認済み）
   if (after.value.reviewId !== null && after.value.comments.length === 0) {
     const del = await graphqlRequest(
+      pr.owner,
       `mutation($reviewId: ID!) {
         deletePullRequestReview(input: { pullRequestReviewId: $reviewId }) {
           pullRequestReview { id }
@@ -507,13 +592,15 @@ export async function deletePendingComment(
  * GitHub 側にそのまま残るので、ユーザーは修正して再送できる。
  */
 export async function submitPendingReview(
+  pr: PrRef,
   reviewId: string
 ): Promise<GithubResult<ReviewSubmitPayload>> {
-  const pat = await getPat();
-  if (!pat) return patRequired('レビュー投稿には PAT の設定が必要です');
+  const entry = await getTokenFor(pr.owner);
+  if (!entry) return tokenRequired(pr.owner, 'レビュー投稿にはトークンの登録が必要です');
   const r = await graphqlRequest<{
     submitPullRequestReview: { pullRequestReview: { url: string } | null } | null;
   }>(
+    pr.owner,
     `mutation($reviewId: ID!) {
       submitPullRequestReview(input: { pullRequestReviewId: $reviewId, event: COMMENT }) {
         pullRequestReview { url }
@@ -533,41 +620,99 @@ export async function submitPendingReview(
   return { ok: true, authMode: r.authMode, value: { htmlUrl: url } };
 }
 
-/** PAT があれば GET /user で有効性確認、なければ GET /rate_limit で疎通確認 */
-export async function testAuth(): Promise<GithubResult<AuthTestPayload>> {
-  const pat = await getPat();
-  if (pat) {
-    const r = await apiGet('/user');
-    if (!r.ok) return r;
-    const json = (await r.res.json()) as { login: string };
+/**
+ * 対象リポジトリへの疎通確認。
+ *
+ * `GET /user` は fine-grained token では権限不要で通るため（実測で確認済み）、
+ * 「トークン文字列が有効」以上のことを何も保証しない。そのため確認は必ず
+ * 対象リポジトリ単位で行い、権限ごとに 1 本ずつ実際のエンドポイントを叩く。
+ * write 権限はレビュー作成という副作用なしに検証できないので確認しない
+ * （失敗時のエラーメッセージで案内する）。
+ */
+export async function testAuth(owner: string, repo: string): Promise<GithubResult<AuthTestPayload>> {
+  const entry = await getTokenFor(owner);
+  if (!entry) {
     return {
-      ok: true,
-      authMode: r.authMode,
-      value: {
-        authenticated: true,
-        login: json.login,
-        rateLimit: rateLimitFromHeaders(r.res.headers),
+      ok: false,
+      authMode: 'anonymous',
+      error: {
+        kind: 'token_required',
+        message: `${owner} 用のトークンが登録されていません`,
+        owner,
+        tokenRegistered: false,
       },
     };
   }
-  const r = await apiGet('/rate_limit');
-  if (!r.ok) return r;
-  const json = (await r.res.json()) as {
-    resources: { core: { limit: number; remaining: number; reset: number } };
-  };
+
+  const base = `/repos/${owner}/${repo}`;
+  const metadata = await checkEndpoint(owner, base);
+  const pullRequests = await checkEndpoint(owner, `${base}/pulls?per_page=1`);
+  const contents = await checkEndpoint(owner, `${base}/contents/`);
+
+  // Metadata すら通らない = トークンのスコープにこの repo が入っていない
+  // （fine-grained は権限不足を 404 に潰すので 403 ではなく 404 で来る）
+  if (metadata.result.ok) await recordVerifiedRepo(owner, repo);
+
+  const rate = await apiGet(owner, '/rate_limit');
+  const rateLimit = rate.ok
+    ? (
+        (await rate.res.json()) as {
+          resources: { core: { limit: number; remaining: number; reset: number } };
+        }
+      ).resources.core
+    : undefined;
+
   return {
     ok: true,
-    authMode: r.authMode,
-    value: { authenticated: false, rateLimit: json.resources.core },
+    authMode: 'pat',
+    value: {
+      authenticated: true,
+      owner,
+      repo,
+      checks: {
+        metadata: metadata.result,
+        pullRequests: pullRequests.result,
+        contents: contents.result,
+      },
+      expiresAt: metadata.expiresAt ?? (await getTokenFor(owner))?.expiresAt,
+      rateLimit,
+    },
   };
 }
 
-function rateLimitFromHeaders(
-  headers: Headers
-): AuthTestPayload['rateLimit'] {
-  const limit = headers.get('x-ratelimit-limit');
-  const remaining = headers.get('x-ratelimit-remaining');
-  const reset = headers.get('x-ratelimit-reset');
-  if (limit == null || remaining == null || reset == null) return undefined;
-  return { limit: Number(limit), remaining: Number(remaining), reset: Number(reset) };
+/** 疎通確認 1 本分。通信自体が失敗しても throw せず結果に畳む */
+async function checkEndpoint(
+  owner: string,
+  pathAndQuery: string
+): Promise<{ result: TokenCheckResult; expiresAt?: string }> {
+  const r = await apiGet(owner, pathAndQuery);
+  if (r.ok) {
+    return {
+      result: { ok: true, status: r.res.status },
+      expiresAt: parseTokenExpiration(
+        r.res.headers.get('github-authentication-token-expiration')
+      ),
+    };
+  }
+  return {
+    result: {
+      ok: false,
+      status: r.error.status,
+      message: describeCheckFailure(r.error),
+    },
+  };
+}
+
+/** 疎通確認の失敗理由を 1 行で。fine-grained では 404 が「スコープ外」を意味しうる */
+function describeCheckFailure(error: GithubApiError): string {
+  if (error.kind === 'not_found') {
+    return '404 — リポジトリが存在しないか、トークンの Repository access に含まれていません';
+  }
+  if (error.kind === 'forbidden') {
+    const perms = error.requiredPermissions ? `（要: ${error.requiredPermissions}）` : '';
+    return `403 — 権限が不足しています${perms}`;
+  }
+  if (error.kind === 'unauthorized') return '401 — トークンが無効または期限切れです';
+  if (error.kind === 'rate_limited') return '429 — レート制限に達しました';
+  return `${error.status ?? '-'} — ${error.message}`;
 }

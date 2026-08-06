@@ -76,6 +76,15 @@
 // - ソース表示の横に overview ruler（.diff-ruler）が出て、追加/削除行の位置が
 //   マーク（.diff-ruler-mark）で示される
 //
+// feat/issue-34-fine-grained-token で追加・変更した確認項目:
+// - トークンストアが単一キー（githubPat）から owner キーのマップ（githubTokens）に変わった。
+//   options は「対象リポジトリ owner/repo + トークン」で登録し、保存と同時に
+//   そのリポジトリへ疎通確認する（GET /user は fine-grained では権限不要で通るため使えない）
+// - ある owner のトークンは別 owner には使われない（1 トークン = 1 owner）
+// - 未登録 owner への TEST_AUTH / 書き込み系は token_required で拒否（旧 pat_required から改名）
+// - 旧 githubPat は起動時に legacyPat へ退避され、options にバナー + 削除ボタンが出る。
+//   退避した旧トークンは動作に一切使われない（フォールバックしない）
+//
 // レート制限（未認証 60 req/h）を消費するため、--pr で TypeScript ファイルを含む
 // 小さめの PR を明示指定するのを推奨（未指定なら PR 一覧の先頭を使う）。
 //
@@ -104,7 +113,48 @@ const userDataDir = mkdtempSync(join(tmpdir(), 'functions-tree-e2e-'));
 
 const BUTTON = '#functions-tree-toggle';
 const PANEL_STATUS = '#functions-tree-panel-host .status';
-const DUMMY_PAT = 'ghp_dummy_e2e_token_do_not_use_1234567890';
+// 実在しない形式のダミー。GitHub に到達しても 401 になるだけで副作用は無い
+const DUMMY_TOKEN = 'github_pat_dummy_e2e_token_do_not_use_1234567890';
+/** トークンストアのキーは owner（lowercase 正規化） */
+const TOKEN_OWNER = repo.split('/')[0].toLowerCase();
+
+/** options ページでトークンを保存する（保存後に疎通確認が自動で走る） */
+async function saveToken(optionsPage, ownerRepo, token) {
+  await optionsPage.fill('#repo-input', ownerRepo);
+  await optionsPage.fill('#token-input', token);
+  await optionsPage.click('#save');
+  await optionsPage.waitForFunction(
+    () => document.querySelectorAll('#tokens li').length > 0,
+    undefined,
+    { timeout: 15_000 }
+  );
+}
+
+/** 保存時の疎通確認が終わるのを待って結果テキストを返す */
+async function waitForSaveResult(optionsPage) {
+  await optionsPage.waitForFunction(
+    () => {
+      const t = document.querySelector('#save-result')?.textContent ?? '';
+      return t !== '' && !t.includes('疎通確認中');
+    },
+    undefined,
+    { timeout: 30_000 }
+  );
+  return ((await optionsPage.locator('#save-result').textContent()) ?? '').trim();
+}
+
+/** 登録済みトークンをすべて削除する */
+async function deleteAllTokens(optionsPage) {
+  while ((await optionsPage.locator('#tokens li').count()) > 0) {
+    await optionsPage.locator('#tokens li .danger').first().click();
+    await optionsPage.waitForTimeout(100);
+  }
+  await optionsPage.waitForFunction(
+    () => document.querySelectorAll('#tokens li').length === 0,
+    undefined,
+    { timeout: 10_000 }
+  );
+}
 
 let failed = false;
 const results = [];
@@ -557,7 +607,7 @@ try {
   await page.locator('#functions-tree-panel-host .graph-area g.node.commentable').first().click();
   const cDetail = await readDetail();
   record(
-    'commentable node: target line shown + add-draft disabled + PAT hint while anonymous',
+    'commentable node: target line shown + add-draft disabled + token hint while anonymous',
     cDetail.hasCommentInput && cDetail.commentTarget.includes('にコメントされます') &&
       cDetail.addDisabled === true && cDetail.addLabel === '下書きに追加' &&
       cDetail.commentAuthVisible && !cDetail.removeVisible,
@@ -566,7 +616,7 @@ try {
   );
   const emptyDrafts = await readDrafts();
   record(
-    'drafts pane: starts empty (count 0, submit disabled, PAT hint shown)',
+    'drafts pane: starts empty (count 0, submit disabled, token hint shown)',
     emptyDrafts.count === '0' && emptyDrafts.submitDisabled === true &&
       emptyDrafts.items.length === 0 && emptyDrafts.authVisible,
     `count=${emptyDrafts.count} submitDisabled=${emptyDrafts.submitDisabled} ` +
@@ -978,12 +1028,17 @@ try {
     waitUntil: 'domcontentloaded',
   });
   await optionsPage.waitForFunction(
-    () => (document.querySelector('#pat-status')?.textContent ?? '') !== '',
+    () => document.querySelector('#tokens') !== null,
     undefined,
     { timeout: 10_000 }
   );
-  const initialStatus = ((await optionsPage.locator('#pat-status').textContent()) ?? '').trim();
-  record('options: opens with PAT unset', initialStatus.includes('未設定'), initialStatus);
+  const initialTokenCount = await optionsPage.locator('#tokens li').count();
+  const emptyHidden = await optionsPage.locator('#tokens-empty').isHidden();
+  record(
+    'options: opens with no tokens registered',
+    initialTokenCount === 0 && !emptyHidden,
+    `tokens=${initialTokenCount} emptyHidden=${emptyHidden}`
+  );
 
   // 10. エラー経路その1: 存在しない PR 番号 → not_found（未認証のうちに確認）
   const notFound = await optionsPage.evaluate(
@@ -1000,55 +1055,132 @@ try {
     JSON.stringify(notFound?.error ?? notFound)
   );
 
-  // 11. ダミー PAT の保存が chrome.storage.local に反映されること
-  await optionsPage.fill('#pat-input', DUMMY_PAT);
-  await optionsPage.click('#save');
+  // 11. ダミートークンの保存が owner キーで chrome.storage.local に入ること
+  await saveToken(optionsPage, repo, DUMMY_TOKEN);
+  const stored = await optionsPage.evaluate(() => chrome.storage.local.get('githubTokens'));
+  const listText = ((await optionsPage.locator('#tokens').textContent()) ?? '').trim();
+  record(
+    'options: token saved under owner key in githubTokens (masked in UI)',
+    stored.githubTokens?.[TOKEN_OWNER]?.token === DUMMY_TOKEN &&
+      !listText.includes(DUMMY_TOKEN) &&
+      listText.includes(TOKEN_OWNER),
+    `keys=${JSON.stringify(Object.keys(stored.githubTokens ?? {}))} list="${listText.slice(0, 120)}"`
+  );
+
+  // 11b. 旧 PAT の単一キーは復活していないこと（新ストアのみを使う）
+  const noLegacyKey = await optionsPage.evaluate(() => chrome.storage.local.get('githubPat'));
+  record(
+    'options: legacy githubPat key is not written by the new store',
+    noLegacyKey.githubPat === undefined,
+    JSON.stringify(noLegacyKey)
+  );
+
+  // 12. エラー経路その2: 無効トークンでの疎通確認 → 401 が人間に読める形で出ること
+  //     （保存と同時に対象リポジトリへの疎通確認が走る。GET /user は fine-grained では
+  //     権限なしでも通るため、確認はリポジトリ単位で行っている）
+  const saveResultText = await waitForSaveResult(optionsPage);
+  record(
+    'error path: repo reachability check with invalid token -> 401 message',
+    saveResultText.includes('401'),
+    saveResultText.replace(/\n/g, ' / ')
+  );
+  await shot(optionsPage, '9-options-token-saved');
+
+  // 12b. owner 単位のキーであること: 別 owner のトークンは引かれない
+  const otherOwnerPending = await optionsPage.evaluate(() =>
+    chrome.runtime.sendMessage({
+      type: 'GET_PENDING_REVIEW',
+      pr: { owner: 'some-other-owner', repo: 'whatever', pr: 1 },
+    })
+  );
+  record(
+    'token store: token for one owner is not used for another owner',
+    otherOwnerPending?.ok === true && otherOwnerPending?.value?.reviewId === null,
+    JSON.stringify(otherOwnerPending)
+  );
+
+  // 12c. トークン未登録の owner への TEST_AUTH は token_required で返ること
+  const testAuthNoToken = await optionsPage.evaluate(() =>
+    chrome.runtime.sendMessage({ type: 'TEST_AUTH', owner: 'some-other-owner', repo: 'whatever' })
+  );
+  record(
+    'TEST_AUTH for unregistered owner -> token_required',
+    testAuthNoToken?.ok === false && testAuthNoToken?.error?.kind === 'token_required',
+    JSON.stringify(testAuthNoToken?.error ?? testAuthNoToken)
+  );
+
+  // 13. トークン削除が chrome.storage.local に反映されること
+  await deleteAllTokens(optionsPage);
+  const cleared = await optionsPage.evaluate(() => chrome.storage.local.get('githubTokens'));
+  record(
+    'options: token deleted from chrome.storage.local',
+    Object.keys(cleared.githubTokens ?? {}).length === 0,
+    JSON.stringify(cleared.githubTokens ?? {})
+  );
+  await shot(optionsPage, '10-options-token-deleted');
+
+  // 13b. 旧 PAT のマイグレーション: githubPat が残っていたら legacyPat へ退避され、
+  //      options に削除導線が出ること（黙って消さない。旧値へのフォールバックもしない）
+  await optionsPage.evaluate(() =>
+    chrome.storage.local.set({ githubPat: 'ghp_legacy_classic_token_for_e2e' })
+  );
+  await optionsPage.reload({ waitUntil: 'domcontentloaded' });
   await optionsPage.waitForFunction(
-    () => (document.querySelector('#pat-status')?.textContent ?? '').includes('保存済み'),
+    () => document.querySelector('#legacy-banner')?.dataset.visible === 'true',
     undefined,
     { timeout: 10_000 }
   );
-  const stored = await optionsPage.evaluate(() => chrome.storage.local.get('githubPat'));
-  const savedStatus = ((await optionsPage.locator('#pat-status').textContent()) ?? '').trim();
+  const afterMigration = await optionsPage.evaluate(() =>
+    chrome.storage.local.get(['githubPat', 'legacyPat', 'githubTokens'])
+  );
   record(
-    'options: PAT saved to chrome.storage.local (masked in UI)',
-    stored.githubPat === DUMMY_PAT && !savedStatus.includes(DUMMY_PAT),
-    savedStatus
+    'legacy PAT: moved to legacyPat, banner shown, not migrated into the owner store',
+    afterMigration.githubPat === undefined &&
+      afterMigration.legacyPat === 'ghp_legacy_classic_token_for_e2e' &&
+      Object.keys(afterMigration.githubTokens ?? {}).length === 0,
+    JSON.stringify(afterMigration)
   );
-  await shot(optionsPage, '9-options-pat-saved');
+  await shot(optionsPage, '11-options-legacy-banner');
 
-  // 12. エラー経路その2: 無効 PAT で接続テスト → 401 が人間に読める形で出ること
-  await optionsPage.click('#test');
-  await optionsPage.waitForFunction(
-    () => {
-      const t = document.querySelector('#test-result')?.textContent ?? '';
-      return t !== '' && !t.includes('テスト中');
-    },
-    undefined,
-    { timeout: 30_000 }
+  // 13c. 退避した旧トークンは動作に一切使われないこと（fallback したら Classic で
+  //      通ってしまい fine-grained 化の検証が成立しなくなる）
+  const legacyNotUsed = await optionsPage.evaluate(
+    ([owner, name]) =>
+      chrome.runtime.sendMessage({
+        type: 'ADD_PENDING_COMMENT',
+        pr: { owner, repo: name, pr: 1 },
+        commitId: 'deadbeef',
+        path: 'src/x.ts',
+        line: 1,
+        body: 'e2e: legacy token must not be used',
+      }),
+    repo.split('/')
   );
-  const testText = ((await optionsPage.locator('#test-result').textContent()) ?? '').trim();
   record(
-    'error path: connection test with invalid PAT -> 401 message',
-    testText.includes('PAT が無効'),
-    testText
+    'legacy PAT: never used as a fallback (still token_required)',
+    legacyNotUsed?.ok === false && legacyNotUsed?.error?.kind === 'token_required',
+    JSON.stringify(legacyNotUsed?.error ?? legacyNotUsed)
   );
-  await shot(optionsPage, '10-options-test-invalid-pat');
 
-  // 13. PAT 削除が chrome.storage.local に反映されること
-  await optionsPage.click('#delete');
+  // 13d. バナーの削除ボタンで退避分も消えること
+  await optionsPage.click('#legacy-delete');
   await optionsPage.waitForFunction(
-    () => (document.querySelector('#pat-status')?.textContent ?? '').includes('未設定'),
+    () => document.querySelector('#legacy-banner')?.dataset.visible === 'false',
     undefined,
     { timeout: 10_000 }
   );
-  const cleared = await optionsPage.evaluate(() => chrome.storage.local.get('githubPat'));
-  record('options: PAT deleted from chrome.storage.local', cleared.githubPat === undefined);
-  await shot(optionsPage, '11-options-pat-deleted');
+  const legacyCleared = await optionsPage.evaluate(() =>
+    chrome.storage.local.get(['githubPat', 'legacyPat'])
+  );
+  record(
+    'legacy PAT: deleted from storage via banner button',
+    legacyCleared.githubPat === undefined && legacyCleared.legacyPat === undefined,
+    JSON.stringify(legacyCleared)
+  );
 
   // === pending review 統合: 下書き操作の検証（実 PR には下書きも投稿もされない） ===
 
-  // 14. PAT 未設定の GET_PENDING_REVIEW はエラーでなく「pending review なし」を返すこと
+  // 14. トークン未登録の GET_PENDING_REVIEW はエラーでなく「pending review なし」を返すこと
   //     （未認証では pending review は存在し得ないため、パネルを開いただけで
   //     エラー表示にならない）
   const anonPending = await optionsPage.evaluate(
@@ -1060,16 +1192,16 @@ try {
     repo.split('/')
   );
   record(
-    'pending review: GET without PAT -> ok with empty state (no API call)',
+    'pending review: GET without token -> ok with empty state (no API call)',
     anonPending?.ok === true && anonPending?.value?.reviewId === null &&
       Array.isArray(anonPending?.value?.comments) &&
       anonPending.value.comments.length === 0,
     JSON.stringify(anonPending)
   );
 
-  // 14b. 書き込み系（下書き追加 / レビュー送信）は PAT 未設定なら GitHub に到達する前に
-  //      pat_required で拒否されること（UI 側のボタン無効化との二重防御）
-  const addPatRequired = await optionsPage.evaluate(
+  // 14b. 書き込み系（下書き追加 / レビュー送信）は、その owner のトークンが未登録なら
+  //      GitHub に到達する前に token_required で拒否されること（ボタン無効化との二重防御）
+  const addTokenRequired = await optionsPage.evaluate(
     ([owner, name]) =>
       chrome.runtime.sendMessage({
         type: 'ADD_PENDING_COMMENT',
@@ -1082,11 +1214,11 @@ try {
     repo.split('/')
   );
   record(
-    'pending review: add comment without PAT -> pat_required (no API call)',
-    addPatRequired?.ok === false && addPatRequired?.error?.kind === 'pat_required',
-    JSON.stringify(addPatRequired?.error ?? addPatRequired)
+    'pending review: add comment without token -> token_required (no API call)',
+    addTokenRequired?.ok === false && addTokenRequired?.error?.kind === 'token_required',
+    JSON.stringify(addTokenRequired?.error ?? addTokenRequired)
   );
-  const submitPatRequired = await optionsPage.evaluate(
+  const submitTokenRequired = await optionsPage.evaluate(
     ([owner, name]) =>
       chrome.runtime.sendMessage({
         type: 'SUBMIT_PENDING_REVIEW',
@@ -1096,14 +1228,14 @@ try {
     repo.split('/')
   );
   record(
-    'pending review: submit without PAT -> pat_required (no API call)',
-    submitPatRequired?.ok === false && submitPatRequired?.error?.kind === 'pat_required',
-    JSON.stringify(submitPatRequired?.error ?? submitPatRequired)
+    'pending review: submit without token -> token_required (no API call)',
+    submitTokenRequired?.ok === false && submitTokenRequired?.error?.kind === 'token_required',
+    JSON.stringify(submitTokenRequired?.error ?? submitTokenRequired)
   );
 
   // 15. PR ページでパネルを開き直し（未認証・SW キャッシュ）、フィルタを外して
-  //     コメント可能ノードに本文を入れても、PAT 未設定の間は「下書きに追加」が
-  //     無効のまま（PAT 導線が出続ける）であること
+  //     コメント可能ノードに本文を入れても、トークン未登録の間は「下書きに追加」が
+  //     無効のまま（トークン導線が出続ける）であること
   await page.bringToFront();
   await page.locator(BUTTON).click();
   await waitForGraphStatus();
@@ -1120,22 +1252,17 @@ try {
     .fill('e2e 下書き（GitHub の pending review に保存される想定）');
   const filledAnon = await readDetail();
   record(
-    'drafts: add stays disabled with body while anonymous (PAT hint shown)',
+    'drafts: add stays disabled with body while anonymous (token hint shown)',
     filledAnon.addDisabled === true && filledAnon.commentAuthVisible,
     `addDisabled=${filledAnon.addDisabled} authVisible=${filledAnon.commentAuthVisible}`
   );
   await shot(page, '12-add-disabled-anonymous');
 
-  // 16. 別タブの options でダミー PAT を保存 → storage.onChanged で「下書きに追加」が
-  //     自動活性化すること（書きかけの本文は消えない）。同時に pending review の
-  //     取得が走り、無効 PAT なので 401 が人間可読で表示されること（エラー経路）
-  await optionsPage.fill('#pat-input', DUMMY_PAT);
-  await optionsPage.click('#save');
-  await optionsPage.waitForFunction(
-    () => (document.querySelector('#pat-status')?.textContent ?? '').includes('保存済み'),
-    undefined,
-    { timeout: 10_000 }
-  );
+  // 16. 別タブの options でダミートークンを保存 → githubTokens の storage.onChanged で
+  //     「下書きに追加」が自動活性化すること（書きかけの本文は消えない）。同時に
+  //     pending review の取得が走り、無効トークンなので 401 が人間可読で出ること
+  await optionsPage.bringToFront();
+  await saveToken(optionsPage, repo, DUMMY_TOKEN);
   await page.bringToFront();
   await page.waitForFunction(
     () => {
@@ -1152,20 +1279,20 @@ try {
   const enabledDetail = await readDetail();
   const pendingFetch = await readDrafts();
   record(
-    'drafts: add auto-enabled after PAT saved (storage.onChanged, body kept)',
+    'drafts: add auto-enabled after token saved (storage.onChanged on githubTokens, body kept)',
     enabledDetail.addDisabled === false && !enabledDetail.commentAuthVisible &&
       enabledDetail.inputValue.includes('e2e 下書き'),
     `addDisabled=${enabledDetail.addDisabled} authVisible=${enabledDetail.commentAuthVisible} ` +
       `input="${enabledDetail.inputValue}"`
   );
   record(
-    'pending review: fetch with invalid PAT -> human-readable 401',
-    pendingFetch.statusState === 'error' && pendingFetch.statusText.includes('PAT が無効'),
+    'pending review: fetch with invalid token -> human-readable 401',
+    pendingFetch.statusState === 'error' && pendingFetch.statusText.includes('トークンが無効'),
     `state=${pendingFetch.statusState} text="${pendingFetch.statusText}"`
   );
-  await shot(page, '13-add-enabled-after-pat');
+  await shot(page, '13-add-enabled-after-token');
 
-  // 17. 「下書きに追加」→ 無効 PAT なので 401 が人間可読で表示され、下書きは増えないこと
+  // 17. 「下書きに追加」→ 無効トークンなので 401 が人間可読で表示され、下書きは増えないこと
   //     （実 PR に pending review は作られない。GitHub 側で拒否される）
   await page.locator('#functions-tree-panel-host .draft-add').click();
   await page.waitForFunction(
@@ -1180,9 +1307,9 @@ try {
   const addResult = await readDetail();
   const draftsAfterAdd = await readDrafts();
   record(
-    'drafts: add with invalid PAT -> human-readable 401, no draft created',
+    'drafts: add with invalid token -> human-readable 401, no draft created',
     addResult.commentStatusState === 'error' &&
-      addResult.commentStatusText.includes('PAT が無効') &&
+      addResult.commentStatusText.includes('トークンが無効') &&
       draftsAfterAdd.count === '0' && draftsAfterAdd.items.length === 0 &&
       draftsAfterAdd.submitDisabled === true,
     `state=${addResult.commentStatusState} text="${addResult.commentStatusText}" ` +
@@ -1190,13 +1317,9 @@ try {
   );
   await shot(page, '14-add-401-no-draft');
 
-  // 後始末: ダミー PAT を削除
-  await optionsPage.click('#delete');
-  await optionsPage.waitForFunction(
-    () => (document.querySelector('#pat-status')?.textContent ?? '').includes('未設定'),
-    undefined,
-    { timeout: 10_000 }
-  );
+  // 後始末: ダミートークンを削除
+  await optionsPage.bringToFront();
+  await deleteAllTokens(optionsPage);
 
   // === bugfix/keyboard-shortcut-leak: Files changed タブでの実挙動確認 ===
   // GitHub の 't' ショートカットが実際に効くのは Files changed タブ

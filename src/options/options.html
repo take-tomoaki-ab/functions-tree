@@ -10,8 +10,12 @@
       --fg: #1f2328;
       --fg-muted: #59636e;
       --bg: #ffffff;
+      --bg-subtle: #f6f8fa;
       --border: #d1d9e0;
       --ok: #1a7f37;
+      --warn: #9a6700;
+      --warn-bg: #fff8c5;
+      --warn-border: #d4a72c;
       --error: #d1242f;
     }
     @media (prefers-color-scheme: dark) {
@@ -19,8 +23,12 @@
         --fg: #f0f6fc;
         --fg-muted: #9198a1;
         --bg: #0d1117;
+        --bg-subtle: #151b23;
         --border: #3d444d;
         --ok: #3fb950;
+        --warn: #d29922;
+        --warn-bg: #2d2611;
+        --warn-border: #6b5424;
         --error: #f85149;
       }
     }
@@ -33,14 +41,23 @@
       font-size: 14px;
       line-height: 1.6;
     }
-    main { max-width: 640px; margin: 0 auto; }
+    main { max-width: 720px; margin: 0 auto; }
     h1 { font-size: 20px; margin: 0 0 4px; }
-    h2 { font-size: 16px; margin: 24px 0 8px; }
+    h2 { font-size: 16px; margin: 28px 0 8px; }
+    h3 { font-size: 14px; margin: 16px 0 6px; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.9em;
+      background: var(--bg-subtle);
+      padding: 1px 4px;
+      border-radius: 4px;
+    }
     .hint { color: var(--fg-muted); font-size: 12px; margin: 4px 0 12px; }
+    .hint ul { margin: 4px 0; padding-left: 18px; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    input[type="password"] {
-      flex: 1;
-      min-width: 260px;
+    .field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 240px; }
+    .field label { font-size: 12px; color: var(--fg-muted); }
+    input[type="text"], input[type="password"] {
       padding: 6px 10px;
       font-size: 14px;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -59,14 +76,58 @@
       border: 1px solid var(--border);
       border-radius: 6px;
     }
-    button:hover { border-color: var(--fg-muted); }
-    .status { font-size: 13px; margin: 12px 0 8px; }
-    .status[data-state="saved"] { color: var(--ok); }
-    .status[data-state="empty"] { color: var(--fg-muted); }
+    button:hover:not(:disabled) { border-color: var(--fg-muted); }
+    button:disabled { opacity: 0.5; cursor: default; }
+    button.danger { color: var(--error); }
+
+    /* 旧トークン残存バナー */
+    .legacy-banner {
+      display: none;
+      gap: 12px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      margin: 12px 0 20px;
+      padding: 12px 14px;
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-border);
+      border-radius: 6px;
+    }
+    .legacy-banner[data-visible="true"] { display: flex; }
+    .legacy-banner .text { flex: 1; min-width: 280px; font-size: 13px; }
+    .legacy-banner strong { color: var(--warn); }
+
+    /* トークン一覧 */
+    .tokens { list-style: none; margin: 8px 0 0; padding: 0; }
+    .tokens li {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin: 0 0 10px;
+      background: var(--bg-subtle);
+    }
+    .token-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .token-owner { font-weight: 600; font-size: 15px; }
+    .token-label { color: var(--fg-muted); font-size: 12px; }
+    .token-actions { margin-left: auto; display: flex; gap: 6px; }
+    .token-meta { font-size: 12px; color: var(--fg-muted); margin: 6px 0 0; }
+    .token-meta dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; }
+    .token-meta dt { color: var(--fg-muted); }
+    .token-meta dd { margin: 0; }
+    .expiry[data-state="soon"] { color: var(--warn); font-weight: 600; }
+    .expiry[data-state="expired"] { color: var(--error); font-weight: 600; }
+    .verify-row { margin: 10px 0 0; }
+    .verify-result { font-size: 12px; margin: 8px 0 0; white-space: pre-wrap; }
+    .verify-result[data-state="ok"] { color: var(--ok); }
+    .verify-result[data-state="partial"] { color: var(--warn); }
+    .verify-result[data-state="error"] { color: var(--error); }
+    .verify-result[data-state="loading"] { color: var(--fg-muted); }
+    .empty { color: var(--fg-muted); font-size: 13px; margin: 8px 0 0; }
+
     .result { font-size: 13px; margin: 12px 0 0; white-space: pre-wrap; }
     .result[data-state="ok"] { color: var(--ok); }
     .result[data-state="error"] { color: var(--error); }
     .result[data-state="loading"] { color: var(--fg-muted); }
+
     .languages { margin: 8px 0 0; padding-left: 20px; font-size: 13px; }
     .languages li { margin: 4px 0; }
     .languages .ext {
@@ -82,21 +143,64 @@
     <h1>Functions Tree 設定</h1>
     <p class="hint">GitHub PR ページ上で関数の依存関係グラフを表示する拡張の設定です。</p>
 
-    <h2>GitHub Personal Access Token (PAT)</h2>
-    <p class="hint">
-      プライベートリポジトリの閲覧と API レート制限の緩和（60 → 5,000 req/h）に使います。
-      fine-grained PAT なら <code>Contents</code> / <code>Pull requests</code> の Read 権限で十分です。
-      トークンはこの端末の <code>chrome.storage.local</code> にのみ保存され、外部に送信されません
-      （送信先は api.github.com のみ）。
-    </p>
-    <p id="pat-status" class="status"></p>
-    <div class="row">
-      <input id="pat-input" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" />
-      <button id="save" type="button">保存</button>
-      <button id="delete" type="button">削除</button>
-      <button id="test" type="button">接続テスト</button>
+    <div id="legacy-banner" class="legacy-banner" data-visible="false">
+      <div class="text">
+        <strong>旧形式のトークンが残っています。</strong>
+        以前のバージョンで保存された単一トークンが見つかりました。
+        現在は owner ごとにトークンを登録する方式に変わっており、<strong>この旧トークンは使われません</strong>。
+        下の「GitHub トークン」から、対象リポジトリの owner 用に fine-grained token を登録し直してください。
+        登録が済んだらこのトークンは削除して構いません。
+      </div>
+      <button id="legacy-delete" class="danger" type="button">旧トークンを削除</button>
     </div>
-    <p id="test-result" class="result"></p>
+
+    <h2>GitHub トークン</h2>
+    <p class="hint">
+      プライベートリポジトリの閲覧、下書き（pending review）の操作、API レート制限の緩和（60 → 5,000 req/h）に使います。
+      トークンはこの端末の <code>chrome.storage.local</code> にのみ保存され、送信先は <code>api.github.com</code> のみです。
+    </p>
+    <p class="hint">
+      <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">fine-grained personal access token</a>
+      を推奨します。1 つのトークンでアクセスできるのは 1 つの owner（ユーザー / Organization）配下だけなので、
+      <strong>owner ごとに 1 つずつ登録</strong>してください。必要な権限は次の 3 つです。
+    </p>
+    <ul class="hint">
+      <li><code>Pull requests: Read and write</code> — PR 情報の取得と下書き・レビュー投稿</li>
+      <li><code>Contents: Read-only</code> — ファイル内容の取得（解析対象）</li>
+      <li><code>Metadata: Read-only</code> — リポジトリの基本情報（他の権限を選ぶと自動で付きます）</li>
+    </ul>
+    <p class="hint">
+      Repository access で<strong>解析したいリポジトリを選択</strong>するのを忘れないでください。
+      選択から漏れたリポジトリは、権限不足ではなく「見つかりません（404）」として扱われます。
+    </p>
+
+    <h3>登録済みのトークン</h3>
+    <ul id="tokens" class="tokens"></ul>
+    <p id="tokens-empty" class="empty">まだトークンが登録されていません（未認証モード: 公開リポジトリのみ・レート制限 60 req/h）。</p>
+
+    <h3>トークンを追加 / 更新</h3>
+    <p class="hint">
+      対象リポジトリを 1 つ指定してください。owner をトークンのキーにし、そのリポジトリへ実際に疎通確認します
+      （<code>GET /user</code> は fine-grained token では権限なしでも通るため、確認には使えません）。
+    </p>
+    <div class="row">
+      <div class="field">
+        <label for="repo-input">対象リポジトリ（owner/repo）</label>
+        <input id="repo-input" type="text" placeholder="octocat/hello-world" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label for="label-input">識別名（任意）</label>
+        <input id="label-input" type="text" placeholder="仕事用" autocomplete="off" />
+      </div>
+    </div>
+    <div class="row" style="margin-top: 8px">
+      <div class="field">
+        <label for="token-input">トークン</label>
+        <input id="token-input" type="password" placeholder="github_pat_… / ghp_…" autocomplete="off" />
+      </div>
+      <button id="save" type="button">保存して疎通確認</button>
+    </div>
+    <p id="save-result" class="result"></p>
 
     <h2>対応言語</h2>
     <p class="hint">
