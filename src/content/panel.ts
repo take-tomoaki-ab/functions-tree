@@ -6,7 +6,12 @@
 
 import type { PendingComment, PendingReviewPayload } from '../shared/github';
 import { describeGithubError } from '../shared/github';
-import type { FunctionGraph, GraphNode, HighlightToken } from '../shared/graph';
+import type {
+  FunctionGraph,
+  GraphNode,
+  HighlightToken,
+  SkippedFile,
+} from '../shared/graph';
 import type {
   AddPendingCommentRequest,
   DeletePendingCommentRequest,
@@ -2195,6 +2200,35 @@ async function renderGraph(): Promise<void> {
   }
 }
 
+/** スキップ理由の日本語ラベル。ここに無い理由（parse_error 等）はそのまま出す */
+const SKIP_REASON_LABELS: Record<string, string> = {
+  changed_file_limit: '変更ファイル数の上限を超えた',
+  dependency_limit: '依存ファイル数の上限を超えた',
+  dependency_fetch_limit: '依存取得のリクエスト上限に達した（この先は連結されない）',
+  dir_listing_unavailable: 'ディレクトリ一覧を取得できなかった',
+  not_found: 'ファイルが見つからなかった',
+  too_large: 'ファイルが大きすぎる',
+  rate_limited: 'GitHub API のレート制限',
+};
+
+/** スキップしたファイルを理由ごとにまとめた説明文（ステータス行の tooltip 用） */
+function describeSkippedFiles(skipped: SkippedFile[]): string {
+  if (skipped.length === 0) return '';
+  const byReason = new Map<string, string[]>();
+  for (const s of skipped) {
+    byReason.set(s.reason, [...(byReason.get(s.reason) ?? []), s.path]);
+  }
+  return [...byReason]
+    .map(([reason, paths]) => {
+      const label = SKIP_REASON_LABELS[reason] ?? reason;
+      // ファイル数が多いと tooltip が読めなくなるので先頭 5 件だけ挙げる
+      const shown = paths.slice(0, 5).join(', ');
+      const rest = paths.length > 5 ? ` ほか ${paths.length - 5} 件` : '';
+      return `${label}（${paths.length}）: ${shown}${rest}`;
+    })
+    .join('\n');
+}
+
 async function loadGraph(pr: PrRef, opts: { forceRefresh?: boolean } = {}): Promise<void> {
   if (!statusEl) return;
   graphBusy = true;
@@ -2223,6 +2257,8 @@ async function loadGraph(pr: PrRef, opts: { forceRefresh?: boolean } = {}): Prom
       `解析 ${graph.analyzedFiles.length} ファイル / スキップ ${graph.skippedFiles.length}` +
       `${graph.unresolvedCallCount > 0 ? ` / 未解決呼び出し ${graph.unresolvedCallCount}` : ''}` +
       `${fromCache ? '（キャッシュ）' : ''}`;
+    // 「なぜ繋がらないか」（取得上限・404 等）はホバーで理由別に見せる（issue #27 B）
+    statusEl.title = describeSkippedFiles(graph.skippedFiles);
     currentGraph = graph;
     await renderGraph();
   } catch (e) {

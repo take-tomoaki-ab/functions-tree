@@ -3,7 +3,7 @@
 // 実行前に pretest（esbuild）が dist-test/analyzer-core.mjs を生成する。
 
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { before, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -43,10 +43,31 @@ async function fetchFixture(path) {
   }
 }
 
+/**
+ * ディレクトリ一覧（SW の contents API 相当）。
+ * import 候補をこれで絞ることで 404 プローブの fetch 予算消費を避ける（issue #27 A）
+ */
+async function listFixtureDir(dir) {
+  try {
+    const entries = await readdir(join(fixturesDir, dir), { withFileTypes: true });
+    return {
+      ok: true,
+      paths: entries
+        .filter((e) => e.isFile())
+        .map((e) => (dir === '' ? e.name : `${dir}/${e.name}`)),
+    };
+  } catch {
+    return { ok: false, reason: 'not_found' };
+  }
+}
+
 /** 変更ファイルはパス文字列 or { path, patch } で指定できるようにする */
 async function buildFixtureGraph(changedFiles, options) {
   const inputs = changedFiles.map((f) => (typeof f === 'string' ? { path: f } : f));
-  return buildGraph(analyzer, inputs, fetchFixture, options);
+  return buildGraph(analyzer, inputs, fetchFixture, {
+    listDir: listFixtureDir,
+    ...options,
+  });
 }
 
 const findNode = (graph, name) => graph.nodes.find((n) => n.name === name);
@@ -103,21 +124,25 @@ describe('analyzeFile: 関数・import・export の抽出', () => {
       local: 'greet',
       source: './greet.js',
       imported: 'default',
+      typeOnly: false,
     });
     assert.deepEqual(byLocal.get('toUpper'), {
       local: 'toUpper',
       source: './util',
       imported: 'toUpper',
+      typeOnly: false,
     });
     assert.deepEqual(byLocal.get('shorten'), {
       local: 'shorten',
       source: './util',
       imported: 'helperFn', // alias の import 先は util 側の公開名
+      typeOnly: false,
     });
     assert.deepEqual(byLocal.get('logger'), {
       local: 'logger',
       source: './logger',
       imported: '*',
+      typeOnly: false,
     });
   });
 
@@ -155,14 +180,24 @@ describe('resolveImportCandidates: 相対 import のパス解決', () => {
     assert.ok(c.includes('src/a/util/index.ts'));
   });
 
-  test('../ で親ディレクトリに上がれる', () => {
-    const c = resolveImportCandidates('src/a/b.ts', '../shared/x');
-    assert.equal(c[0], 'src/shared/x.ts');
+  test('候補順は .tsx が .ts より先で、index には .jsx も含まれる（issue #27 A）', () => {
+    const c = resolveImportCandidates('src/a/b.ts', './card');
+    assert.ok(
+      c.indexOf('src/a/card.tsx') < c.indexOf('src/a/card.ts'),
+      '.tsx を .ts より先に試す'
+    );
+    assert.ok(c.includes('src/a/card/index.jsx'), 'index.jsx も候補に入る');
   });
 
-  test('NodeNext 形式 ./x.js は x.ts / x.tsx を優先候補にする', () => {
+  test('../ で親ディレクトリに上がれる', () => {
+    const c = resolveImportCandidates('src/a/b.ts', '../shared/x');
+    assert.equal(c[0], 'src/shared/x.tsx');
+    assert.ok(c.includes('src/shared/x.ts'));
+  });
+
+  test('NodeNext 形式 ./x.js は x.tsx / x.ts を優先候補にする', () => {
     const c = resolveImportCandidates('src/a.ts', './x.js');
-    assert.deepEqual(c.slice(0, 3), ['src/x.ts', 'src/x.tsx', 'src/x.js']);
+    assert.deepEqual(c.slice(0, 3), ['src/x.tsx', 'src/x.ts', 'src/x.js']);
   });
 
   test('外部パッケージ（相対でない import）は解決しない', () => {
@@ -450,6 +485,120 @@ describe('JSX: 関数コンポーネントの呼び出し', () => {
       a.functions.find((f) => f.name === 'helper').calls.map((c) => c.callee),
       ['trim']
     );
+  });
+});
+
+describe('issue #27: 連結の安定性', () => {
+  const CHILDREN = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6'];
+
+  test('A: 6 子のディレクトリ import が import 順によらず全件連結される', async () => {
+    for (const [parentFile, parentFn] of [
+      ['many/parent.tsx', 'Parent'],
+      ['many/parent-reversed.tsx', 'ParentReversed'],
+    ]) {
+      const graph = await buildFixtureGraph([parentFile]);
+      const missing = CHILDREN.filter((c) => !hasEdge(graph, parentFn, c));
+      assert.deepEqual(missing, [], `${parentFile}: 連結されない子がある`);
+      assert.deepEqual(
+        graph.skippedFiles,
+        [],
+        `${parentFile}: スキップは発生しないはず`
+      );
+    }
+  });
+
+  test('A: index.jsx のディレクトリ import も解決される（#24 ×-6 の回帰）', async () => {
+    const graph = await buildFixtureGraph(['many/parent.tsx']);
+    assert.ok(graph.analyzedFiles.includes('many/c5/index.jsx'));
+  });
+
+  test('A: ディレクトリ一覧で候補を絞るので fetch 予算をほとんど使わない', async () => {
+    let fetches = 0;
+    const countingFetch = async (path) => {
+      fetches++;
+      return fetchFixture(path);
+    };
+    let listings = 0;
+    const countingList = async (dir) => {
+      listings++;
+      return listFixtureDir(dir);
+    };
+    const graph = await buildGraph(
+      analyzer,
+      [{ path: 'many/parent.tsx' }],
+      countingFetch,
+      { listDir: countingList }
+    );
+    assert.equal(graph.analyzedFiles.length, 7, '親 + 子 6 件');
+    // 親 1 + 子 6 = 7 回のファイル取得。404 プローブは 0 回
+    assert.equal(fetches, 7);
+    // many/ と many/cN の 7 ディレクトリ。同じディレクトリは 1 回だけ
+    assert.equal(listings, 7);
+  });
+
+  test('A: 型だけの import は依存として取得しない', async () => {
+    const graph = await buildFixtureGraph(['types/parent.tsx']);
+    assert.ok(
+      !graph.analyzedFiles.includes('types/props.ts'),
+      'import type だけの source は取得しない'
+    );
+    assert.ok(
+      graph.analyzedFiles.includes('types/badge.tsx'),
+      '同じ source を値としても import していれば取得する'
+    );
+    assert.ok(hasEdge(graph, 'Parent', 'Badge'));
+  });
+
+  test('A: import type の束縛は typeOnly として抽出される', async () => {
+    const content = (await fetchFixture('types/parent.tsx')).content;
+    const a = analyzer.analyzeFile('types/parent.tsx', content);
+    const byLocal = Object.fromEntries(a.imports.map((b) => [b.local, b.typeOnly]));
+    assert.equal(byLocal.Props, true, 'import type 文');
+    assert.equal(byLocal.Variant, true, 'インラインの type specifier');
+    assert.equal(byLocal.Badge, false, '値の import');
+  });
+
+  test('B: fetch 予算切れが dependency_fetch_limit として記録される', async () => {
+    const graph = await buildFixtureGraph(['many/parent.tsx'], {
+      maxDependencyFetches: 4,
+    });
+    const limited = graph.skippedFiles.filter(
+      (s) => s.reason === 'dependency_fetch_limit'
+    );
+    assert.ok(limited.length > 0, '予算切れが記録される');
+    // 同じパスを何度も積まない
+    const paths = limited.map((s) => s.path);
+    assert.equal(new Set(paths).size, paths.length);
+  });
+
+  test('C: ネストした同名 const があっても import した本物にエッジが張られる', async () => {
+    const graph = await buildFixtureGraph(['scope/parent.tsx']);
+    const parent = graph.nodes.find((n) => n.name === 'Parent');
+    const realCard = graph.nodes.find(
+      (n) => n.name === 'Card' && n.filePath === 'scope/card.tsx'
+    );
+    const localCard = graph.nodes.find(
+      (n) => n.name === 'Card' && n.filePath === 'scope/parent.tsx'
+    );
+    assert.ok(realCard, 'import 先の Card がノード化されている');
+    assert.ok(localCard, 'ネストしたローカル Card もノードとしては残る');
+    assert.ok(
+      graph.edges.some((e) => e.from === parent.id && e.to === realCard.id),
+      'Parent → 本物の Card'
+    );
+    assert.ok(
+      !graph.edges.some((e) => e.from === parent.id && e.to === localCard.id),
+      'Parent → ネストしたローカル Card は張らない'
+    );
+  });
+
+  test('C: ネスト定義しか候補が無ければ従来どおり解決される', async () => {
+    const content = (await fetchFixture('app.ts')).content;
+    const a = analyzer.analyzeFile('app.ts', content);
+    // app.ts の render / main はトップレベル。ネスト判定が誤爆していないこと
+    assert.equal(a.functions.find((f) => f.name === 'render').isNested, false);
+    const graph = await buildFixtureGraph(['app.ts']);
+    assert.ok(hasEdge(graph, 'main', 'render'));
   });
 });
 

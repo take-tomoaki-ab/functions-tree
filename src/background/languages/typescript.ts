@@ -104,6 +104,24 @@ function isFunctionBoundary(node: Node): boolean {
 }
 
 /**
+ * その関数定義がファイルのトップレベルにあるか（issue #27）。
+ * `function foo` / `const foo = () => {}` が `program` 直下（`export` 付きを含む）なら
+ * トップレベル。ブロックや他の関数の内側にあるものはネスト定義として扱う。
+ */
+function isTopLevelDefinition(funcNode: Node): boolean {
+  // const foo = ... は variable_declarator → (lexical|variable)_declaration が宣言文
+  const statement =
+    funcNode.type === 'variable_declarator' ? funcNode.parent : funcNode;
+  if (!statement) return false;
+  const parent = statement.parent;
+  if (!parent) return false;
+  return (
+    parent.type === 'program' ||
+    (parent.type === 'export_statement' && parent.parent?.type === 'program')
+  );
+}
+
+/**
  * 直接の export 判定: `export function foo` / `export const foo = ...` /
  * `export default function foo`。
  * `export { foo }` / `export default foo`（識別子参照）は別途 collectExportClauses で拾う。
@@ -143,18 +161,37 @@ function collectExportClauses(rootNode: Node): Map<string, string> {
   return map;
 }
 
+/** `import type ...` / `import { type X }` の `type` トークンを持つか */
+function hasTypeKeyword(node: Node): boolean {
+  return node.children.some((c) => c?.type === 'type');
+}
+
 /** import_clause から { ローカル名 → import 先の名前 } の束縛を集める */
 function collectImportBindings(importNode: Node, source: string): ImportBinding[] {
   const bindings: ImportBinding[] = [];
+  // `import type { Props } from './types'` は値を持ち込まないので束縛全体が型だけ
+  const statementTypeOnly = hasTypeKeyword(importNode);
   for (const child of importNode.namedChildren) {
     if (!child || child.type !== 'import_clause') continue;
     for (const c of child.namedChildren) {
       if (!c) continue;
       if (c.type === 'identifier') {
-        bindings.push({ local: c.text, source, imported: 'default' });
+        bindings.push({
+          local: c.text,
+          source,
+          imported: 'default',
+          typeOnly: statementTypeOnly,
+        });
       } else if (c.type === 'namespace_import') {
         const id = c.namedChildren.find((n) => n?.type === 'identifier');
-        if (id) bindings.push({ local: id.text, source, imported: '*' });
+        if (id) {
+          bindings.push({
+            local: id.text,
+            source,
+            imported: '*',
+            typeOnly: statementTypeOnly,
+          });
+        }
       } else if (c.type === 'named_imports') {
         for (const spec of c.namedChildren) {
           if (!spec || spec.type !== 'import_specifier') continue;
@@ -165,6 +202,8 @@ function collectImportBindings(importNode: Node, source: string): ImportBinding[
               local: (alias ?? name).text,
               source,
               imported: name.text,
+              // `import { type A, B }` は specifier ごとに型かどうかが変わる
+              typeOnly: statementTypeOnly || hasTypeKeyword(spec),
             });
           }
         }
@@ -184,9 +223,20 @@ function hasTsExtension(path: string): boolean {
 }
 
 /**
+ * 拡張子なし import の解決候補の拡張子（issue #27）。
+ * JSX を持つコンポーネントが依存の大半なので .tsx を .ts より先に試す。
+ * listDir が使える環境ではこの順序は「複数実在したときにどれを採るか」だけに効くが、
+ * ディレクトリ一覧が取れない環境では 404 プローブの回数に直結する。
+ */
+const RESOLVE_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.cjs'];
+
+/** ディレクトリ import（`./card` → `card/index.*`）の index 候補（.jsx 対応 = issue #24 ×-6） */
+const INDEX_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js'];
+
+/**
  * 相対 import の解決候補パスを優先順で返す。
- * - 拡張子なし → .ts / .tsx / .js / ... と index ファイルを試す
- * - `./x.js` 形式（NodeNext スタイル）→ 実体が x.ts のことが多いので .ts / .tsx も試す
+ * - 拡張子なし → .tsx / .ts / .js / ... と index ファイルを試す
+ * - `./x.js` 形式（NodeNext スタイル）→ 実体が x.ts のことが多いので .tsx / .ts も試す
  */
 export function resolveImportCandidates(fromPath: string, spec: string): string[] {
   if (!isRelativeSpec(spec)) return [];
@@ -197,7 +247,7 @@ export function resolveImportCandidates(fromPath: string, spec: string): string[
   if (hasTsExtension(base)) {
     const candidates = [];
     if (/\.js$/.test(base)) {
-      candidates.push(base.replace(/\.js$/, '.ts'), base.replace(/\.js$/, '.tsx'));
+      candidates.push(base.replace(/\.js$/, '.tsx'), base.replace(/\.js$/, '.ts'));
     } else if (/\.jsx$/.test(base)) {
       candidates.push(base.replace(/\.jsx$/, '.tsx'));
     }
@@ -205,8 +255,8 @@ export function resolveImportCandidates(fromPath: string, spec: string): string[
     return candidates;
   }
   return [
-    ...metadata.extensions.map((ext) => `${base}${ext}`),
-    ...['.ts', '.tsx', '.js'].map((ext) => `${base}/index${ext}`),
+    ...RESOLVE_EXTENSIONS.map((ext) => `${base}${ext}`),
+    ...INDEX_EXTENSIONS.map((ext) => `${base}/index${ext}`),
   ];
 }
 
@@ -241,6 +291,8 @@ export const typescriptLanguage: LanguageDefinition = {
         name,
         kind: funcNode.type,
         isMethod: funcNode.type === 'method_definition',
+        isNested:
+          funcNode.type !== 'method_definition' && !isTopLevelDefinition(funcNode),
         startLine: rangeNode.startPosition.row + 1,
         endLine: rangeNode.endPosition.row + 1,
         startIndex: rangeNode.startIndex,
@@ -261,8 +313,12 @@ export const typescriptLanguage: LanguageDefinition = {
   },
 
   dependencyTargets(analysis: FileAnalysis): DependencyTarget[] {
+    // 型だけの import（`import type`）はグラフに現れないので取得しない。
+    // 同じ source を値としても import していれば、そちらの束縛で対象に残る（issue #27 A）
     const specs = new Set(
-      analysis.imports.filter((b) => isRelativeSpec(b.source)).map((b) => b.source)
+      analysis.imports
+        .filter((b) => !b.typeOnly && isRelativeSpec(b.source))
+        .map((b) => b.source)
     );
     return [...specs]
       .map((spec) => ({
@@ -292,14 +348,20 @@ export const typescriptLanguage: LanguageDefinition = {
     };
 
     if (!callee.includes('.')) {
+      const tables = ctx.file(analysis.path);
       // 1. 同一ファイルのトップレベル関数
-      const local = ctx.file(analysis.path)?.topLevel.get(callee);
+      const local = tables?.topLevel.get(callee);
       if (local) return { path: analysis.path, fn: local };
       // 2. import 束縛 → 依存ファイルの export
-      const binding = analysis.imports.find((b) => b.local === callee);
+      const binding = analysis.imports.find(
+        (b) => b.local === callee && !b.typeOnly
+      );
       if (binding && binding.imported !== '*') {
         return resolveImported(binding, binding.imported);
       }
+      // 3. ネスト定義（issue #27 C）。import した本物を上書きしないよう最後に見る
+      const nested = tables?.nested.get(callee);
+      if (nested) return { path: analysis.path, fn: nested };
       return null;
     }
     const parts = callee.split('.');
@@ -312,7 +374,7 @@ export const typescriptLanguage: LanguageDefinition = {
       }
       // ns.func() → namespace import 先の export
       const binding = analysis.imports.find(
-        (b) => b.local === head && b.imported === '*'
+        (b) => b.local === head && b.imported === '*' && !b.typeOnly
       );
       if (binding) return resolveImported(binding, member);
     }
