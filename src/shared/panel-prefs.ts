@@ -1,5 +1,5 @@
 // サイドペイン（関数詳細等）の幅（ユーザーがドラッグでリサイズした値）の保存・取得。
-// 保存先は chrome.storage.local（settings.ts の PAT 保存と同じ方針）。
+// 保存先は chrome.storage.local（settings.ts のトークン保存と同じ方針）。
 
 const SIDE_PANE_WIDTH_KEY = 'sidePaneWidthPx';
 

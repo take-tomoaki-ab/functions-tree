@@ -70,8 +70,8 @@ export interface BuildGraphRequest {
 
 /**
  * 現在の PR の pending review（GitHub ネイティブの下書きレビュー）を取得する。
- * pending review は認証ユーザー本人にしか見えないため、PAT 未設定時はエラーではなく
- * 「pending review なし」（reviewId: null, comments: []）の ok 応答が返る。
+ * pending review は認証ユーザー本人にしか見えないため、その owner のトークンが
+ * 未登録ならエラーではなく「pending review なし」（reviewId: null, comments: []）の ok 応答が返る。
  */
 export interface GetPendingReviewRequest {
   type: 'GET_PENDING_REVIEW';
@@ -83,7 +83,8 @@ export interface GetPendingReviewRequest {
  * POST /pulls/{n}/reviews（event なし = PENDING）でレビューごと作成し、あれば
  * GraphQL の addPullRequestReviewThread で追記する。応答は更新後の pending review 全体。
  * line は patch の RIGHT サイド（head）に含まれる行であること（GraphNode.commentableLines）。
- * PAT 未設定時は kind: 'pat_required' のエラーが返る（UI 側のボタン無効化と二重防御）。
+ * その owner のトークンが未登録なら kind: 'token_required' のエラーが返る
+ * （UI 側のボタン無効化と二重防御）。
  */
 export interface AddPendingCommentRequest {
   type: 'ADD_PENDING_COMMENT';
@@ -135,9 +136,16 @@ export interface SubmitPendingReviewRequest {
   reviewId: string;
 }
 
-/** PAT の有効性確認。PAT があれば GET /user、なければ GET /rate_limit */
+/**
+ * 対象リポジトリへの疎通確認。fine-grained token では `GET /user` が権限不要で
+ * 通ってしまい何も保証しないため、必ず owner / repo を指定して実際のエンドポイントを叩く。
+ * その owner のトークンが未登録なら kind: 'token_required' のエラーが返る。
+ */
 export interface TestAuthRequest {
   type: 'TEST_AUTH';
+  /** 疎通確認の対象リポジトリの owner（トークンを引くキーでもある） */
+  owner: string;
+  repo: string;
 }
 
 /** options ページを開く（content script からは直接開けないため SW に依頼） */

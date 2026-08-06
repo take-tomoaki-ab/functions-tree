@@ -21,7 +21,8 @@ import type {
 import { sendToBackground } from '../shared/messages';
 import { getSidePaneWidth, setSidePaneWidth } from '../shared/panel-prefs';
 import { draftNodeIds, findCommentForNode } from '../shared/review-drafts';
-import { getPat, PAT_KEY } from '../shared/settings';
+import type { TokenStore } from '../shared/settings';
+import { hasTokenFor, normalizeOwner, TOKENS_KEY } from '../shared/settings';
 import { createDiffNav } from './diff-nav';
 import type { GraphFilter } from './mermaid-source';
 import { filterGraph } from './mermaid-source';
@@ -910,29 +911,45 @@ let sidePaneWidthPx: number | null = null;
 let zoomLevel = 1;
 // ズームコントロールの表示更新関数（倍率表示・ボタン活性）。パネル構築時に差し込む
 let zoomUiUpdater: (() => void) | null = null;
-// PAT が設定されているか（コメント投稿ボタンの活性条件）。
+// いま見ている PR の owner 用トークンが登録されているか（コメント投稿ボタンの活性条件）。
+// fine-grained token は 1 トークン = 1 owner なので、単一の boolean ではなく
+// 「この PR の owner のトークンがあるか」で判定する。
 // パネルを開いたときに読み、storage.onChanged で追従する
-// （パネルの「PAT を設定する」から options で保存 → 戻るとボタンが自動で活きる）
-let patConfigured = false;
-// 表示中のコメントフォームの状態更新関数（PAT 設定変更時に呼ぶ）
+// （パネルの「トークンを登録する」から options で保存 → 戻るとボタンが自動で活きる）
+let tokenConfigured = false;
+// 表示中のコメントフォームの状態更新関数（トークン登録の変更時に呼ぶ）
 let commentUiUpdater: (() => void) | null = null;
+// 認証導線のボタン・文言を owner 名込みで更新する関数（パネル構築時に差し込む）
+const authNoticeUpdaters = new Set<() => void>();
+
+/** 「`{owner}` 用のトークンを登録する」。owner が未確定なら汎用文言にする */
+function tokenPromptLabel(): string {
+  return currentPr ? `${currentPr.owner} 用のトークンを登録する` : 'トークンを登録する';
+}
+
+function refreshAuthNotices(): void {
+  for (const update of authNoticeUpdaters) update();
+}
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || !(PAT_KEY in changes)) return;
-  const v = changes[PAT_KEY].newValue as unknown;
-  patConfigured = typeof v === 'string' && v.length > 0;
+  if (area !== 'local' || !(TOKENS_KEY in changes)) return;
+  const store = (changes[TOKENS_KEY].newValue ?? {}) as TokenStore;
+  const owner = currentPr ? normalizeOwner(currentPr.owner) : null;
+  const token = owner ? store[owner]?.token : undefined;
+  tokenConfigured = typeof token === 'string' && token.length > 0;
   commentUiUpdater?.();
-  // PAT が設定されたら pending review を取りに行く（その PAT の下書きが既にあるかも
-  // しれない）。外されたら pending review は見えなくなるので表示を空にする
+  refreshAuthNotices();
+  // トークンが登録されたら pending review を取りに行く（そのトークンの下書きが既に
+  // あるかもしれない）。外されたら pending review は見えなくなるので表示を空にする
   if (panelHost && currentPr) {
-    if (patConfigured) {
+    if (tokenConfigured) {
       void loadPendingReview(currentPr);
     } else {
       pendingReviewId = null;
       drafts = [];
     }
   }
-  renderDrafts(); // 送信ボタンの活性・PAT 導線も追従させる
+  renderDrafts(); // 送信ボタンの活性・トークン導線も追従させる
 });
 /**
  * パネル表示中の Esc キー処理。document の capture で拾う
@@ -1273,9 +1290,12 @@ function buildPanel(): HTMLElement {
   const openOptions = document.createElement('button');
   openOptions.className = 'open-options';
   openOptions.type = 'button';
-  openOptions.textContent = 'PAT を設定する';
+  openOptions.textContent = tokenPromptLabel();
   openOptions.addEventListener('click', () => {
     void sendToBackground({ type: 'OPEN_OPTIONS' });
+  });
+  authNoticeUpdaters.add(() => {
+    openOptions.textContent = tokenPromptLabel();
   });
   authNoticeEl.append(noticeText, openOptions);
 
@@ -1404,7 +1424,7 @@ function buildDraftsPane(): HTMLElement {
   draftsRefreshEl.textContent = '再読み込み';
   draftsRefreshEl.title = 'GitHub から下書き（pending review）を取得し直す';
   draftsRefreshEl.addEventListener('click', () => {
-    if (draftsBusy || !patConfigured || !currentPr) return;
+    if (draftsBusy || !tokenConfigured || !currentPr) return;
     void loadPendingReview(currentPr);
   });
   reviewSubmitEl = document.createElement('button');
@@ -1416,14 +1436,21 @@ function buildDraftsPane(): HTMLElement {
   draftsAuthEl = document.createElement('div');
   draftsAuthEl.className = 'drafts-auth';
   const authText = document.createElement('span');
-  authText.textContent =
-    '下書きは GitHub の pending review に保存されるため、利用には PAT が必要です。';
+  const draftsAuthMessage = (): string =>
+    currentPr
+      ? `下書きは GitHub の pending review に保存されるため、${currentPr.owner} 用のトークンが必要です。`
+      : '下書きは GitHub の pending review に保存されるため、トークンが必要です。';
+  authText.textContent = draftsAuthMessage();
   const openOptions = document.createElement('button');
   openOptions.className = 'open-options';
   openOptions.type = 'button';
-  openOptions.textContent = 'PAT を設定する';
+  openOptions.textContent = tokenPromptLabel();
   openOptions.addEventListener('click', () => {
     void sendToBackground({ type: 'OPEN_OPTIONS' });
+  });
+  authNoticeUpdaters.add(() => {
+    authText.textContent = draftsAuthMessage();
+    openOptions.textContent = tokenPromptLabel();
   });
   draftsAuthEl.append(authText, openOptions);
 
@@ -1451,10 +1478,10 @@ function renderDrafts(): void {
     draftsBusy ||
     drafts.length === 0 ||
     pendingReviewId === null ||
-    !patConfigured;
-  if (draftsRefreshEl) draftsRefreshEl.disabled = draftsBusy || !patConfigured;
-  // 下書きは GitHub の pending review に保存するため、追加の時点から PAT が必要
-  draftsAuthEl.dataset.visible = patConfigured ? 'false' : 'true';
+    !tokenConfigured;
+  if (draftsRefreshEl) draftsRefreshEl.disabled = draftsBusy || !tokenConfigured;
+  // 下書きは GitHub の pending review に保存するため、追加の時点からトークンが必要
+  draftsAuthEl.dataset.visible = tokenConfigured ? 'false' : 'true';
   if (drafts.length === 0) {
     const empty = document.createElement('li');
     empty.className = 'drafts-empty';
@@ -1636,7 +1663,7 @@ async function requestPendingMutation(
 
 /**
  * GitHub から現在の PR の pending review を取得して表示に反映する。
- * パネルを開いたとき・PAT が設定されたときに呼ぶ。PAT 未設定時は background が
+ * パネルを開いたとき・トークンが登録されたときに呼ぶ。トークン未登録時は background が
  * 「pending review なし」を返すのでエラーにはならない。
  */
 async function loadPendingReview(pr: PrRef): Promise<void> {
@@ -1977,7 +2004,7 @@ function renderNodeDetail(node: GraphNode): void {
  * コメント可能ノード用の下書きフォームを組み立てる。
  * - 「下書きに追加」は GitHub の pending review に下書きコメントとして保存する
  *   （PR の相手にはまだ見えない。送信はパネル下部の「n 件の下書きをレビューとして送信」）。
- *   GitHub 側への保存なので、追加の時点から PAT が必要
+ *   GitHub 側への保存なので、追加の時点からトークンが必要
  * - 対象行の表示（commentableLines が複数なら select で選択可能。既定は commentLine =
  *   関数範囲内の最初の追加行、なければ最初のコメント可能行）
  * - このノードの下書きが既にあれば本文・行をプリフィルし、「下書きを更新」「下書きを削除」になる。
@@ -2035,15 +2062,17 @@ function buildCommentForm(node: GraphNode): HTMLElement {
   remove.type = 'button';
   remove.textContent = '下書きを削除';
 
-  // PAT 導線（下書きが GitHub 側に保存されるため、追加の時点から PAT が必要）
+  // トークン導線（下書きが GitHub 側に保存されるため、追加の時点からトークンが必要）
   const auth = document.createElement('div');
   auth.className = 'comment-auth';
   const authText = document.createElement('span');
-  authText.textContent = '下書きの保存（pending review）には PAT が必要です。';
+  authText.textContent = currentPr
+    ? `下書きの保存（pending review）には ${currentPr.owner} 用のトークンが必要です。`
+    : '下書きの保存（pending review）にはトークンが必要です。';
   const openOptions = document.createElement('button');
   openOptions.className = 'open-options';
   openOptions.type = 'button';
-  openOptions.textContent = 'PAT を設定する';
+  openOptions.textContent = tokenPromptLabel();
   openOptions.addEventListener('click', () => {
     void sendToBackground({ type: 'OPEN_OPTIONS' });
   });
@@ -2055,16 +2084,16 @@ function buildCommentForm(node: GraphNode): HTMLElement {
   const update = (): void => {
     const hasDraft = findCommentForNode(drafts, node) !== undefined;
     submit.textContent = hasDraft ? '下書きを更新' : '下書きに追加';
-    submit.disabled = input.value.trim() === '' || !patConfigured || draftsBusy;
+    submit.disabled = input.value.trim() === '' || !tokenConfigured || draftsBusy;
     remove.hidden = !hasDraft;
     remove.disabled = draftsBusy;
-    auth.dataset.visible = patConfigured ? 'false' : 'true';
+    auth.dataset.visible = tokenConfigured ? 'false' : 'true';
   };
   input.addEventListener('input', update);
 
   submit.addEventListener('click', () => {
     const body = input.value.trim();
-    if (body === '' || draftsBusy || !patConfigured) return;
+    if (body === '' || draftsBusy || !tokenConfigured) return;
     if (!currentPr || !currentHeadSha) return;
     const pr = currentPr;
     const commitId = currentHeadSha;
@@ -2286,14 +2315,17 @@ function openPanel(): void {
   drafts = [];
   draftsBusy = false;
   submitting = false;
-  // 送信ボタン・下書き追加の活性条件。以後の変更は storage.onChanged が追従する
+  authNoticeUpdaters.clear();
+  // 送信ボタン・下書き追加の活性条件。以後の変更は storage.onChanged が追従する。
+  // 判定は「いま見ている PR の owner のトークンがあるか」（1 トークン = 1 owner のため）
   const pr = currentPr;
-  void getPat().then((pat) => {
-    patConfigured = pat !== null;
+  void hasTokenFor(pr.owner).then((has) => {
+    tokenConfigured = has;
     commentUiUpdater?.();
+    refreshAuthNotices();
     renderDrafts();
     // 下書きは GitHub の pending review が正。パネルを開くたびに取得する
-    // （PR 画面で作った下書きも拾える。PAT 未設定なら「なし」が返るだけ）
+    // （PR 画面で作った下書きも拾える。トークン未登録なら「なし」が返るだけ）
     if (panelHost && currentPr === pr) void loadPendingReview(pr);
   });
   // 前回リサイズしたサイドペインの幅を復元する
